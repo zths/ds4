@@ -1,3 +1,9 @@
+> **Fork branch: experimental Blackwell V4.1 CUDA vision.** This branch preserves
+> a tested local implementation based on upstream commit `0aaea5a238fb41a35106a551e73c8409dfb751ac`.
+> See [the fork guide](docs/BLACKWELL_V41_FORK.md) for capabilities, build/run
+> examples, validation results and limitations. It is not a merge of the latest
+> upstream main branch.
+
 <p align="center">
   <img src="logo.svg" alt="DwarfStar logo" width="220">
 </p>

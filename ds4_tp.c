@@ -22,6 +22,8 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/mman.h>
+#include <sched.h>
 #include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
@@ -39,8 +41,12 @@
 
 #define DS4_TP_MAGIC UINT32_C(0x44533454) /* "DS4T" */
 #define DS4_TP_BATCH_MAGIC UINT32_C(0x44533442) /* "DS4B" */
-/* V4.1 CUDA workers now return half-logit frames after successful work. */
-#define DS4_TP_PROTOCOL_VERSION 14u
+/* Multimodal commands stream token/image payloads after a small framed header,
+ * without a 32-bit aggregate length or a second full-history staging copy. */
+/* Version 17 allows CUDA IPC batch-2 decode to publish both sessions'
+ * attention/FFN vectors before each shared arrival. Older peers must fail
+ * the handshake rather than use the old scalar/bulk gate schedule. */
+#define DS4_TP_PROTOCOL_VERSION 17u
 
 #define DS4_TP_DEFAULT_TIMEOUT_SEC 300
 /* Once both ranks enter a Metal gate, a live exchange normally completes in
@@ -185,6 +191,9 @@ struct ds4_tp {
     int control_fd;
     int data_fd;                /* TCP fallback, headers, and verify gates */
     bool rdma_active;
+    bool local_capable, local_active, local_unreleased;
+    _Atomic uint64_t *local_flags; /* two close flags, then [rank][slot] seq */
+    size_t local_bytes;
     uint32_t peer_ctx;
     uint32_t n_layer;
     uint32_t n_embd;
@@ -365,10 +374,7 @@ static int tp_tcp_exchange(ds4_tp *tp, ds4_tp_gate_header *header,
     return ok;
 }
 
-#ifdef DS4_TP_HAVE_VERBS
-/* UC queue pairs do not report a dead remote reliably.  The control socket
- * does, so sample it while polling an RDMA completion and abort before the
- * Metal command-buffer watchdog fires. */
+/* Sample the control socket while waiting for RDMA or local-host arrival. */
 static int tp_peer_closed(const ds4_tp *tp) {
     char byte;
     const ssize_t n = recv(tp->control_fd, &byte, 1,
@@ -377,7 +383,6 @@ static int tp_peer_closed(const ds4_tp *tp) {
     if (n > 0) return 0;
     return errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR;
 }
-#endif
 
 static int tp_listen(const char *host, int port, char *err, size_t errlen) {
     char portbuf[16];
@@ -1938,6 +1943,9 @@ static int tp_hello_exchange(ds4_tp *tp, const ds4_tp_identity *id, int rdma_ok,
         .gate_slot_start = id->gate_slot_start,
         .gate_slot_step = id->gate_slot_step,
         .gates_per_token = id->gates_per_token,
+#ifdef __linux__
+        .pad = 1u, /* optional same-host bootstrap; old peers leave this zero */
+#endif
     };
     memcpy(mine.gate_slot_mask, id->gate_slot_mask,
            sizeof(mine.gate_slot_mask));
@@ -1985,6 +1993,7 @@ static int tp_hello_exchange(ds4_tp *tp, const ds4_tp_identity *id, int rdma_ok,
         return 0;
     }
     tp->peer_ctx = theirs.ctx_size;
+    tp->local_capable = (mine.pad & theirs.pad & 1u) != 0;
     tp->n_layer = id->n_layer;
     tp->n_embd = id->n_embd;
     tp->vec_bytes = (uint64_t)id->n_embd * sizeof(float);
@@ -2099,6 +2108,144 @@ fail:
     return 0;
 }
 
+/* Host flags replace the small TCP gate messages; tensors remain in CUDA
+ * slabs. Flags publish completed data or, in the negotiated event mode, a
+ * submitted record whose completion the consumer waits for on its GPU. */
+static void tp_local_close(ds4_tp *tp) {
+    if (!tp->local_flags) return;
+    atomic_store_explicit(&tp->local_flags[tp->rank], 1, memory_order_release);
+    const double deadline = tp_now_sec() + tp->gate_timeout_ms / 1000.0;
+    while (!atomic_load_explicit(&tp->local_flags[1 - tp->rank], memory_order_acquire)) {
+        if (tp_peer_closed(tp) || tp_now_sec() >= deadline) break;
+        sched_yield();
+    }
+    tp->local_unreleased = tp->local_active &&
+        !atomic_load_explicit(&tp->local_flags[1 - tp->rank], memory_order_acquire);
+    munmap((void *)tp->local_flags, tp->local_bytes);
+    tp->local_flags = NULL;
+    tp->local_active = false;
+}
+
+int ds4_tp_local_setup(ds4_tp *tp, int ready, const void *handle, void *peer_handle) {
+    if (!tp || !tp->local_capable) return 0;
+    struct {
+        uint32_t ready, uid;
+        char boot[40];
+        unsigned char handle[64];
+    } mine = {0}, peer = {0};
+    mine.uid = (uint32_t)geteuid();
+    int fd = open("/proc/sys/kernel/random/boot_id", O_RDONLY | O_CLOEXEC);
+    if (fd >= 0) {
+        const ssize_t n = read(fd, mine.boot, sizeof(mine.boot) - 1);
+        if (n < 36) mine.boot[0] = 0;
+        close(fd);
+    }
+    const char *setting = getenv("DS4_CUDA_TP_IPC");
+    mine.ready = ready && mine.boot[0] && !(setting && !strcmp(setting, "0"));
+    if (mine.ready) memcpy(mine.handle, handle, sizeof(mine.handle));
+    if (!tp_tcp_exchange(tp, NULL, NULL, &mine, &peer, sizeof(mine))) return -1;
+    if (!mine.ready || !peer.ready || mine.uid != peer.uid ||
+        memcmp(mine.boot, peer.boot, sizeof(mine.boot))) return 0;
+    memcpy(peer_handle, peer.handle, sizeof(peer.handle));
+
+    char path[64] = {0}, peer_path[64] = {0};
+    fd = -1;
+    tp->local_bytes = (2u + 2u * tp->n_slots) * sizeof(uint64_t);
+    if (tp->rank == 0) {
+        snprintf(path, sizeof(path), "/dev/shm/ds4-cuda-ipc-XXXXXX");
+        fd = mkstemp(path);
+        if (fd < 0 || ftruncate(fd, (off_t)tp->local_bytes) != 0) {
+            if (fd >= 0) { close(fd); unlink(path); fd = -1; }
+            path[0] = 0;
+        }
+    }
+    if (!tp_tcp_exchange(tp, NULL, NULL, path, peer_path, sizeof(path))) {
+        if (fd >= 0) { close(fd); unlink(path); }
+        return -1;
+    }
+    if (tp->rank == 1 && !strncmp(peer_path, "/dev/shm/ds4-cuda-ipc-", strlen("/dev/shm/ds4-cuda-ipc-")) &&
+        memchr(peer_path, 0, sizeof(peer_path)))
+        fd = open(peer_path, O_RDWR | O_CLOEXEC | O_NOFOLLOW);
+    int ok = 0;
+    struct stat st;
+    if (fd >= 0 && fstat(fd, &st) == 0 && S_ISREG(st.st_mode) &&
+        st.st_uid == geteuid() && st.st_size == (off_t)tp->local_bytes) {
+        void *map = mmap(NULL, tp->local_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        if (map != MAP_FAILED) {
+            tp->local_flags = map;
+            if (tp->rank == 0)
+                for (uint32_t i = 0; i < 2u + 2u * tp->n_slots; i++)
+                    atomic_init(&tp->local_flags[i], 0);
+            ok = 1;
+        }
+    }
+    if (fd >= 0) close(fd);
+    int peer_ok = 0;
+    const int exchanged = tp_tcp_exchange(tp, NULL, NULL, &ok, &peer_ok, sizeof(ok));
+    if (tp->rank == 0 && path[0]) unlink(path);
+    if (!exchanged || !ok || !peer_ok) {
+        if (tp->local_flags) munmap((void *)tp->local_flags, tp->local_bytes);
+        tp->local_flags = NULL;
+        return exchanged ? 0 : -1;
+    }
+    return 1;
+}
+
+int ds4_tp_local_confirm(ds4_tp *tp, int ready) {
+    int peer_ready = 0;
+    if (!tp || !tp->local_flags ||
+        !tp_tcp_exchange(tp, NULL, NULL, &ready, &peer_ready, sizeof(ready))) return -1;
+    tp->local_active = ready && peer_ready;
+    return tp->local_active;
+}
+
+bool ds4_tp_is_local(const ds4_tp *tp) { return tp && tp->local_active; }
+
+int ds4_tp_local_event_setup(ds4_tp *tp, int ready, const void *handles, void *peer_handles) {
+    if (!ds4_tp_is_local(tp) || !handles || !peer_handles) return 0;
+    struct { uint32_t ready; unsigned char handles[128]; } mine = {0}, peer = {0};
+    mine.ready = ready != 0;
+    if (ready) memcpy(mine.handles, handles, sizeof(mine.handles));
+    if (!tp_tcp_exchange(tp, NULL, NULL, &mine, &peer, sizeof(mine))) return -1;
+    if (!mine.ready || !peer.ready) return 0;
+    memcpy(peer_handles, peer.handles, sizeof(peer.handles));
+    return 1;
+}
+
+int ds4_tp_local_event_confirm(ds4_tp *tp, int ready) {
+    int peer_ready = 0;
+    if (!ds4_tp_is_local(tp) ||
+        !tp_tcp_exchange(tp, NULL, NULL, &ready, &peer_ready, sizeof(ready))) return -1;
+    return ready && peer_ready;
+}
+
+bool ds4_tp_local_slab_released(const ds4_tp *tp) { return !tp || !tp->local_unreleased; }
+
+int ds4_tp_local_gate(ds4_tp *tp, uint32_t layer, uint32_t gate, uint64_t seq) {
+    if (!ds4_tp_is_local(tp) || layer >= tp->n_layer || gate >= 2u || !seq) return 0;
+    const uint32_t slot = layer * 2u + gate;
+    _Atomic uint64_t *mine = &tp->local_flags[2u + tp->rank * tp->n_slots + slot];
+    _Atomic uint64_t *peer = &tp->local_flags[2u + (1u - tp->rank) * tp->n_slots + slot];
+    atomic_store_explicit(mine, seq, memory_order_release);
+    double deadline = 0;
+    unsigned spins = 0;
+    for (;;) {
+        const uint64_t arrived = atomic_load_explicit(peer, memory_order_acquire);
+        if (arrived == seq) return 1;
+        if (arrived > seq || atomic_load_explicit(&tp->local_flags[1 - tp->rank], memory_order_acquire)) break;
+        if ((++spins & 255u) == 0) {
+            const double now = tp_now_sec();
+            if (!deadline) deadline = now + tp->gate_timeout_ms / 1000.0;
+            if (now >= deadline || tp_peer_closed(tp)) break;
+            sched_yield();
+        }
+    }
+    fprintf(stderr, "ds4-tp: local gate failed rank=%d layer=%u gate=%u seq=%llu\n",
+            tp->rank, layer, gate, (unsigned long long)seq);
+    ds4_tp_mark_failed(tp);
+    return 0;
+}
+
 int ds4_tp_attach_slab(ds4_tp *tp, void *base, char *err, size_t errlen) {
     tp->slab = base;
     memset(tp->slab + tp->in_flags_off, 0, (uint64_t)tp->n_slots * 8);
@@ -2122,6 +2269,7 @@ int ds4_tp_attach_slab(ds4_tp *tp, void *base, char *err, size_t errlen) {
 
 void ds4_tp_free(ds4_tp *tp) {
     if (!tp) return;
+    tp_local_close(tp);
 #ifdef DS4_TP_HAVE_VERBS
     tp_rdma_close(tp);
 #endif
@@ -2132,6 +2280,7 @@ void ds4_tp_free(ds4_tp *tp) {
 
 void ds4_tp_detach_slab(ds4_tp *tp) {
     if (!tp) return;
+    tp_local_close(tp);
 #ifdef DS4_TP_HAVE_VERBS
     tp_rdma_close(tp);
 #endif
@@ -2453,32 +2602,27 @@ int ds4_tp_send_sync_multimodal(ds4_tp *tp, uint64_t session_id,
                                 const int *tokens, uint32_t n_tokens,
                                 const ds4_vision_span *images,
                                 uint32_t image_count) {
-    uint64_t bytes64 = sizeof(ds4_tp_multimodal_command_header) +
-                       (uint64_t)n_tokens * sizeof(int32_t);
-    if (!tp || (!tokens && n_tokens) || (!images && image_count) ||
-        tp->n_embd == 0 || bytes64 > UINT32_MAX)
+    /* A worker advertises zero to adopt the leader's per-session context. */
+    if (!tp || !tokens || !n_tokens || (tp->peer_ctx && n_tokens > tp->peer_ctx) ||
+        (!images && image_count) || image_count > n_tokens || tp->n_embd == 0)
         return 0;
+    uint64_t previous_end = 0;
     for (uint32_t i = 0; i < image_count; i++) {
-        const uint64_t values = (uint64_t)images[i].embedding.token_count *
-                                tp->n_embd;
-        if (values > UINT64_MAX / sizeof(float)) return 0;
-        const uint64_t data_bytes = values * sizeof(float);
-        const uint64_t add_bytes = sizeof(ds4_tp_vision_wire) + data_bytes;
-        if (!images[i].embedding.data || add_bytes > UINT32_MAX ||
-            bytes64 > UINT32_MAX - add_bytes)
+        const ds4_vision_embedding *embedding = &images[i].embedding;
+        const uint64_t end = (uint64_t)images[i].token_start + embedding->token_count;
+        const uint64_t values = (uint64_t)embedding->token_count * tp->n_embd;
+        if (!embedding->data || !embedding->token_count || !embedding->width ||
+            !embedding->height || images[i].token_start < previous_end ||
+            end > n_tokens || values > SIZE_MAX / sizeof(float))
             return 0;
-        bytes64 += add_bytes;
+        previous_end = end;
     }
-    uint8_t *payload = malloc((size_t)bytes64);
-    if (!payload) return 0;
     ds4_tp_multimodal_command_header h = {
         session_id, n_tokens, image_count
     };
-    memcpy(payload, &h, sizeof(h));
-    uint8_t *p = payload + sizeof(h);
-    int32_t *wire_tokens = (int32_t *)p;
-    for (uint32_t i = 0; i < n_tokens; i++) wire_tokens[i] = tokens[i];
-    p += (uint64_t)n_tokens * sizeof(int32_t);
+    if (!tp_send_frame(tp->control_fd, DS4_TP_FRAME_SYNC_MULTIMODAL, &h, sizeof(h)) ||
+        !tp_write_full(tp->control_fd, tokens, (size_t)n_tokens * sizeof(int32_t)))
+        goto failed;
     for (uint32_t i = 0; i < image_count; i++) {
         const ds4_vision_embedding *embedding = &images[i].embedding;
         ds4_tp_vision_wire wire = {
@@ -2493,17 +2637,17 @@ int ds4_tp_send_sync_multimodal(ds4_tp *tp, uint64_t session_id,
         };
         memcpy(wire.fingerprint, embedding->fingerprint,
                sizeof(wire.fingerprint));
-        memcpy(p, &wire, sizeof(wire));
-        p += sizeof(wire);
-        uint64_t data_bytes = (uint64_t)embedding->token_count *
-                              tp->n_embd * sizeof(float);
-        memcpy(p, embedding->data, (size_t)data_bytes);
-        p += data_bytes;
+        const size_t data_bytes = (size_t)embedding->token_count *
+                                  tp->n_embd * sizeof(float);
+        if (!tp_write_full(tp->control_fd, &wire, sizeof(wire)) ||
+            !tp_write_full(tp->control_fd, embedding->data, data_bytes))
+            goto failed;
     }
-    int ok = tp_send_frame(tp->control_fd, DS4_TP_FRAME_SYNC_MULTIMODAL,
-                           payload, (uint32_t)bytes64);
-    free(payload);
-    return ok;
+    return 1;
+failed:
+    ds4_tp_mark_failed(tp);
+    shutdown(tp->control_fd, SHUT_RDWR);
+    return 0;
 }
 
 int ds4_tp_send_eval(ds4_tp *tp, uint64_t session_id,
@@ -2573,6 +2717,52 @@ int ds4_tp_send_mixed_batch(ds4_tp *tp, uint64_t prefill_session_id,
                                  payload, bytes);
     free(payload);
     return ok;
+}
+
+/* These transfers run only while both ranks are at a completed frontier.
+ * Drain a failed destination write to preserve control-stream framing. */
+static int tp_payload_transfer(ds4_tp *tp, FILE *fp, uint64_t bytes, bool send_data) {
+    unsigned char *buf = malloc(1u << 20);
+    if (!buf) { ds4_tp_mark_failed(tp); shutdown(tp->control_fd, SHUT_RDWR); return 0; }
+    int ok = 1;
+    while (bytes) {
+        size_t n = bytes < (1u << 20) ? (size_t)bytes : (1u << 20);
+        if (send_data) {
+            if (fread(buf, 1, n, fp) != n || !tp_write_full(tp->control_fd, buf, n)) {
+                ok = 0; ds4_tp_mark_failed(tp); shutdown(tp->control_fd, SHUT_RDWR); break;
+            }
+        } else {
+            if (!tp_read_full(tp->control_fd, buf, n)) {
+                ok = 0; ds4_tp_mark_failed(tp); shutdown(tp->control_fd, SHUT_RDWR); break;
+            }
+            if (ok && fwrite(buf, 1, n, fp) != n) ok = 0;
+        }
+        bytes -= n;
+    }
+    free(buf);
+    return ok;
+}
+
+int ds4_tp_save_worker_payload(ds4_tp *tp, uint64_t id, FILE *fp, uint64_t bytes,
+                                char *err, size_t errlen) {
+    uint64_t msg[2] = {id, bytes};
+    if (!tp_send_frame(tp->control_fd, DS4_TP_FRAME_PAYLOAD_SAVE, msg, sizeof(msg)) ||
+        !ds4_tp_wait_command_ack(tp, id, "snapshot save", err, errlen)) return 0;
+    if (!tp_payload_transfer(tp, fp, bytes, false)) {
+        tp_set_err(err, errlen, "tp: snapshot receive/write failed"); return 0;
+    }
+    return 1;
+}
+
+int ds4_tp_load_worker_payload(ds4_tp *tp, uint64_t id, FILE *fp, uint64_t bytes,
+                                char *err, size_t errlen) {
+    uint64_t msg[2] = {id, bytes};
+    if (!tp_send_frame(tp->control_fd, DS4_TP_FRAME_PAYLOAD_LOAD, msg, sizeof(msg)) ||
+        !ds4_tp_wait_command_ack(tp, id, "snapshot load ready", err, errlen)) return 0;
+    if (!tp_payload_transfer(tp, fp, bytes, true)) {
+        tp_set_err(err, errlen, "tp: snapshot send/read failed"); return 0;
+    }
+    return ds4_tp_wait_command_ack(tp, id, "snapshot restore", err, errlen);
 }
 
 int ds4_tp_send_command_ack(ds4_tp *tp, uint64_t session_id, int status) {
@@ -2684,40 +2874,34 @@ static int tp_command_decode_multimodal(ds4_tp *tp,
                                         const uint8_t *payload,
                                         uint32_t bytes,
                                         char *err, size_t errlen) {
-    if (bytes < sizeof(ds4_tp_multimodal_command_header)) return 0;
+    if (bytes != sizeof(ds4_tp_multimodal_command_header)) return 0;
     ds4_tp_multimodal_command_header h;
     memcpy(&h, payload, sizeof(h));
-    uint64_t pos = sizeof(h);
-    uint64_t token_bytes = (uint64_t)h.token_count * sizeof(int32_t);
-    if (pos + token_bytes > bytes) return 0;
-    if (h.image_count > ((uint64_t)bytes - pos - token_bytes) /
-                        sizeof(ds4_tp_vision_wire))
+    if (!h.token_count || h.token_count > tp->peer_ctx ||
+        h.image_count > h.token_count || !tp->n_embd)
         return 0;
-    int *tokens = malloc(h.token_count ?
-                         (size_t)h.token_count * sizeof(tokens[0]) : 1u);
+    int *tokens = malloc((size_t)h.token_count * sizeof(tokens[0]));
     ds4_vision_span *images = h.image_count ?
         calloc(h.image_count, sizeof(images[0])) : NULL;
     if (!tokens || (h.image_count && !images)) {
-        free(tokens);
-        free(images);
         tp_set_err(err, errlen, "tp: multimodal command allocation failed");
-        return -1;
+        goto allocation_failed;
     }
-    const int32_t *wire_tokens = (const int32_t *)(payload + pos);
-    for (uint32_t i = 0; i < h.token_count; i++) tokens[i] = wire_tokens[i];
-    pos += token_bytes;
+    if (!tp_read_full(tp->control_fd, tokens, (size_t)h.token_count * sizeof(int32_t)))
+        goto malformed;
+    uint64_t previous_end = 0;
     for (uint32_t i = 0; i < h.image_count; i++) {
-        if (pos + sizeof(ds4_tp_vision_wire) > bytes) goto malformed;
         ds4_tp_vision_wire wire;
-        memcpy(&wire, payload + pos, sizeof(wire));
-        pos += sizeof(wire);
+        if (!tp_read_full(tp->control_fd, &wire, sizeof(wire))) goto malformed;
         uint64_t values = (uint64_t)wire.token_count * wire.data_width;
+        const uint64_t end = (uint64_t)wire.token_start + wire.token_count;
         if (wire.token_count == 0 || wire.data_width != tp->n_embd ||
-            wire.width == 0 ||
+            wire.width == 0 || wire.height == 0 || wire.token_start < previous_end ||
+            end > h.token_count ||
             values > SIZE_MAX / sizeof(float))
             goto malformed;
         uint64_t data_bytes = values * sizeof(float);
-        if (data_bytes > (uint64_t)bytes - pos) goto malformed;
+        previous_end = end;
         images[i].token_start = wire.token_start;
         images[i].embedding.data = malloc((size_t)data_bytes);
         if (!images[i].embedding.data) {
@@ -2731,10 +2915,9 @@ static int tp_command_decode_multimodal(ds4_tp *tp,
         images[i].embedding.content_height = wire.content_height;
         memcpy(images[i].embedding.fingerprint, wire.fingerprint,
                sizeof(wire.fingerprint));
-        memcpy(images[i].embedding.data, payload + pos, (size_t)data_bytes);
-        pos += data_bytes;
+        if (!tp_read_full(tp->control_fd, images[i].embedding.data, (size_t)data_bytes))
+            goto malformed;
     }
-    if (pos != bytes) goto malformed;
     command->session_id = h.session_id;
     command->tokens = tokens;
     command->n_tokens = h.token_count;
@@ -2745,7 +2928,7 @@ static int tp_command_decode_multimodal(ds4_tp *tp,
 malformed:
     tp_set_err(err, errlen, "tp: malformed multimodal sync command");
 allocation_failed:
-    for (uint32_t i = 0; i < h.image_count; i++)
+    for (uint32_t i = 0; images && i < h.image_count; i++)
         ds4_vision_embedding_free(&images[i].embedding);
     free(images);
     free(tokens);
@@ -2794,6 +2977,16 @@ int ds4_tp_recv_command(ds4_tp *tp, ds4_tp_command *command,
         if (bytes != sizeof(command->session_id)) { ok = 0; break; }
         memcpy(&command->session_id, payload, sizeof(command->session_id));
         break;
+    case DS4_TP_FRAME_PAYLOAD_SAVE:
+    case DS4_TP_FRAME_PAYLOAD_LOAD: {
+        uint64_t msg[2];
+        if (bytes != sizeof(msg)) { ok = 0; break; }
+        memcpy(msg, payload, sizeof(msg));
+        command->session_id = msg[0];
+        command->seq = msg[1];
+        if (!msg[1] || msg[1] > (UINT64_C(16) << 30)) ok = 0;
+        break;
+    }
     case DS4_TP_FRAME_EVAL:
     case DS4_TP_FRAME_GLM_MTP: {
         ds4_tp_eval_command msg;
@@ -2863,6 +3056,11 @@ int ds4_tp_recv_command(ds4_tp *tp, ds4_tp_command *command,
     }
     free(payload);
     if (ok <= 0) {
+        /* A partial streaming command has no resynchronization boundary. */
+        if (ftype == DS4_TP_FRAME_SYNC_MULTIMODAL) {
+            ds4_tp_mark_failed(tp);
+            shutdown(tp->control_fd, SHUT_RDWR);
+        }
         ds4_tp_command_free(command);
         if (ok == 0) {
             tp_set_err(err, errlen, "tp: invalid command frame type %u (%u bytes)",
@@ -3108,7 +3306,33 @@ int ds4_tp_worker_run(ds4_engine *engine, const ds4_tp_options *opt) {
             break;
         }
 
-        if (command.type == DS4_TP_FRAME_SYNC ||
+        if (command.type == DS4_TP_FRAME_PAYLOAD_SAVE ||
+            command.type == DS4_TP_FRAME_PAYLOAD_LOAD) {
+            FILE *snapshot = tmpfile();
+            int status = snapshot ? 0 : 1;
+            if (!status && command.type == DS4_TP_FRAME_PAYLOAD_SAVE) {
+                status = ds4_session_payload_bytes(session) != command.seq ||
+                         ds4_session_save_payload(session, snapshot, err, sizeof(err)) ||
+                         fflush(snapshot) || (uint64_t)ftello(snapshot) != command.seq;
+                if (!status) rewind(snapshot);
+            }
+            if (!ds4_tp_send_command_ack(tp, command.session_id, status)) rc = 1;
+            if (!status && !rc) {
+                if (command.type == DS4_TP_FRAME_PAYLOAD_SAVE) {
+                    if (!tp_payload_transfer(tp, snapshot, command.seq, true)) rc = 1;
+                } else {
+                    status = !tp_payload_transfer(tp, snapshot, command.seq, false);
+                    if (!status) {
+                        rewind(snapshot);
+                        status = ds4_session_load_rank_payload(session, snapshot, command.seq,
+                                                               err, sizeof(err));
+                    }
+                    if (!ds4_tp_send_command_ack(tp, command.session_id, status)) rc = 1;
+                }
+            }
+            if (snapshot) fclose(snapshot);
+            if (status) ds4_log(stderr, DS4_LOG_ERROR, "tp worker snapshot: %s", err);
+        } else if (command.type == DS4_TP_FRAME_SYNC ||
             command.type == DS4_TP_FRAME_SYNC_MULTIMODAL) {
             prompt.len = 0;
             for (uint32_t i = 0; i < command.n_tokens; i++) {

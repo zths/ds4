@@ -103,6 +103,20 @@ void ds4_tp_free(ds4_tp *tp);
 
 int ds4_tp_rank(const ds4_tp *tp);
 bool ds4_tp_is_rdma(const ds4_tp *tp);
+/* Same-host CUDA IPC bootstrap. The opaque 64-byte CUDA handles travel only
+ * after both peers advertise support. Returns 1 when local state is ready,
+ * 0 for an ordinary TCP/RDMA fallback, -1 for a broken connection. */
+int ds4_tp_local_setup(ds4_tp *tp, int ready, const void *handle, void *peer_handle);
+int ds4_tp_local_confirm(ds4_tp *tp, int ready);
+/* Optional CUDA event bootstrap after local memory has been confirmed.
+ * Two opaque event handles, 64 bytes each; refusal keeps the old gate. */
+int ds4_tp_local_event_setup(ds4_tp *tp, int ready, const void *handles, void *peer_handles);
+int ds4_tp_local_event_confirm(ds4_tp *tp, int ready);
+bool ds4_tp_is_local(const ds4_tp *tp);
+/* After detach, false means a lost peer never acknowledged closing its CUDA
+ * import. Keep that exported allocation until the CUDA context is destroyed. */
+bool ds4_tp_local_slab_released(const ds4_tp *tp);
+int ds4_tp_local_gate(ds4_tp *tp, uint32_t layer, uint32_t gate, uint64_t seq);
 uint32_t ds4_tp_peer_ctx(const ds4_tp *tp);
 bool ds4_tp_failed(const ds4_tp *tp);
 void ds4_tp_mark_failed(ds4_tp *tp);
@@ -215,6 +229,8 @@ typedef enum {
     DS4_TP_FRAME_RDMA_POSTED = 20,
     DS4_TP_FRAME_GLM_MTP = 21,
     DS4_TP_FRAME_SYNC_CHECKPOINT = 22,
+    DS4_TP_FRAME_PAYLOAD_SAVE = 23,
+    DS4_TP_FRAME_PAYLOAD_LOAD = 24,
 } ds4_tp_frame_type;
 
 typedef struct {
@@ -230,6 +246,12 @@ typedef struct {
     ds4_vision_span *images;
     uint32_t n_images;
 } ds4_tp_command;
+
+/* Bounded host staging; each rank retains its own KV/logit/Engram state. */
+int ds4_tp_save_worker_payload(ds4_tp *tp, uint64_t id, FILE *fp, uint64_t bytes,
+                                char *err, size_t errlen);
+int ds4_tp_load_worker_payload(ds4_tp *tp, uint64_t id, FILE *fp, uint64_t bytes,
+                                char *err, size_t errlen);
 
 int ds4_tp_recv_command(
         ds4_tp *tp,

@@ -1244,7 +1244,144 @@ static int check_tp_attention(void) {
     return 1;
 }
 
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+static int check_mask_bits(void) {
+    const uint32_t widths[] = {1, 7, 8, 9, 255, 256, 257, 16385, 1048573, 1048576};
+    for (size_t wi = 0; wi < sizeof(widths) / sizeof(*widths); wi++) {
+        const uint32_t width = widths[wi], rows = 3, blocks = (width + 7u) / 8u;
+        const uint32_t words = (blocks + 31u) / 32u, top = blocks < 2048u ? blocks : 2048u;
+        const size_t bytes = (size_t)width * rows * 4u, mask_bytes = (size_t)words * rows * 4u;
+        float *scores = malloc(bytes), *a = malloc(bytes), *b = malloc(bytes);
+        uint32_t *ids = malloc((size_t)top * rows * 4u);
+        uint32_t *ma = malloc(mask_bytes), *mb = malloc(mask_bytes);
+        CHECK(scores && a && b && ids && ma && mb);
+        for (size_t i = 0; i < bytes / 4u; i++) scores[i] = random_value();
+        for (uint32_t r = 0; r < rows; r++) for (uint32_t i = 0; i < top; i++) {
+            /* Duplicates, invalid sentinels and bits on both word boundaries. */
+            ids[(size_t)r * top + i] = i % 7u == 0 ? UINT32_MAX : (i * 7919u + r * 31u) % blocks;
+        }
+        ds4_gpu_tensor *selected = upload(ids, (size_t)top * rows * 4u);
+        ds4_gpu_tensor *plain = upload(NULL, (size_t)blocks * rows * 4u);
+        ds4_gpu_tensor *packed = upload(NULL, mask_bytes), *direct = upload(NULL, mask_bytes);
+        ds4_gpu_tensor *x = upload(NULL, bytes), *y = upload(NULL, bytes);
+        CHECK(selected && plain && packed && direct && x && y);
+        CHECK(ds4_gpu_begin_commands());
+        CHECK(ds4_gpu_dsv4_topk_mask_tensor(plain, selected, blocks, rows, top));
+        CHECK(ds4_gpu_dsv41_carry_copy(packed, 0, plain, blocks, rows, DS4_V41_CARRY_MASK, true));
+        CHECK(ds4_gpu_dsv41_candidate_mask_bits(direct, selected, blocks, rows, top));
+        CHECK(ds4_gpu_end_commands());
+        CHECK(ds4_gpu_tensor_read(packed, 0, ma, mask_bytes));
+        CHECK(ds4_gpu_tensor_read(direct, 0, mb, mask_bytes));
+        CHECK(!memcmp(ma, mb, mask_bytes));
+        for (uint32_t ratio = 1; ratio <= 2; ratio++) for (int late = 0; late < 2; late++) {
+            const uint32_t start = late ? width * ratio - 2u : 0;
+            /* Width one has no valid -1 start position. */
+            if (start == UINT32_MAX) continue;
+            CHECK(ds4_gpu_tensor_write(x, 0, scores, bytes));
+            CHECK(ds4_gpu_tensor_write(y, 0, scores, bytes));
+            CHECK(ds4_gpu_begin_commands());
+            CHECK(ds4_gpu_dsv41_candidate_filter(x, plain, width, rows, start, ratio));
+            CHECK(ds4_gpu_dsv41_candidate_filter_bits(y, direct, width, rows, start, ratio));
+            CHECK(ds4_gpu_end_commands());
+            CHECK(ds4_gpu_tensor_read(x, 0, a, bytes));
+            CHECK(ds4_gpu_tensor_read(y, 0, b, bytes));
+            CHECK(!memcmp(a, b, bytes));
+        }
+        CHECK(!ds4_gpu_dsv41_candidate_mask_bits(direct, selected, blocks, rows + 1u, top));
+        CHECK(!ds4_gpu_dsv41_candidate_filter_bits(y, direct, width, rows, 0, 0));
+        ds4_gpu_tensor_free(selected); ds4_gpu_tensor_free(plain);
+        ds4_gpu_tensor_free(packed); ds4_gpu_tensor_free(direct);
+        ds4_gpu_tensor_free(x); ds4_gpu_tensor_free(y);
+        free(scores); free(a); free(b); free(ids); free(ma); free(mb);
+    }
+    fprintf(stderr, "V4.1 candidate mask bitsets: bitwise identical through 1M positions\n");
+    return 1;
+}
+
+static int check_bf16_cache(void) {
+    const uint32_t width = 512, keys = 1536, rows = 8, heads = 32;
+    float *kv = malloc((size_t)keys * width * 4), *a = malloc(512u * width * 4);
+    float *b = malloc(512u * width * 4);
+    uint16_t *packed = malloc((size_t)keys * width * 2);
+    float *query = malloc((size_t)rows * heads * width * 4);
+    float *weights = malloc((size_t)rows * heads * 4);
+    int32_t *ids = malloc((size_t)rows * 512 * 4);
+    float *sinks = NULL;
+    CHECK(!posix_memalign((void **)&sinks, getpagesize(), getpagesize()));
+    memset(sinks, 0, getpagesize());
+    CHECK(ds4_gpu_set_model_map(sinks, getpagesize()));
+    CHECK(kv && a && b && packed && query && weights && ids);
+    for (size_t i = 0; i < (size_t)keys * width; i++) {
+        kv[i] = bf16(random_value()); uint32_t bits; memcpy(&bits, &kv[i], 4); packed[i] = bits >> 16u;
+    }
+    for (size_t i = 0; i < (size_t)rows * heads * width; i++) query[i] = bf16(random_value());
+    for (size_t i = 0; i < (size_t)rows * heads; i++) weights[i] = bf16(random_value());
+    for (size_t i = 0; i < (size_t)rows * 512; i++) ids[i] = (i * 17u) % keys;
+    ds4_gpu_tensor *f = upload(kv, (size_t)keys * width * 4);
+    ds4_gpu_tensor *h = upload(packed, (size_t)keys * width * 2);
+    ds4_gpu_tensor *q = upload(query, (size_t)rows * heads * width * 4);
+    ds4_gpu_tensor *w = upload(weights, (size_t)rows * heads * 4);
+    ds4_gpu_tensor *id = upload(ids, (size_t)rows * 512 * 4);
+    ds4_gpu_tensor *x = upload(NULL, 512u * width * 4);
+    ds4_gpu_tensor *y = upload(NULL, 512u * width * 4);
+    ds4_gpu_tensor *raw = upload(kv, (127u + rows) * width * 4u);
+    CHECK(f && h && q && w && id && x && y && raw);
+    CHECK(ds4_gpu_dsv41_gather_kv(x, f, id, keys, 512));
+    CHECK(ds4_gpu_dsv41_gather_kv_bf16(y, h, id, keys, 512));
+    CHECK(ds4_gpu_tensor_read(x, 0, a, 512u * width * 4u));
+    CHECK(ds4_gpu_tensor_read(y, 0, b, 512u * width * 4u));
+    CHECK(!memcmp(a, b, 512u * width * 4u));
+    /* Index keys cover exponent ranges that FP16 cannot preserve. */
+    for (size_t i = 0; i < (size_t)keys * 128; i++) {
+        kv[i] = bf16(ldexpf(random_value(), (int)(i % 80) - 40));
+        uint32_t bits; memcpy(&bits, &kv[i], 4); packed[i] = bits >> 16u;
+    }
+    CHECK(ds4_gpu_tensor_write(f, 0, kv, (size_t)keys * 128 * 4));
+    CHECK(ds4_gpu_tensor_write(h, 0, packed, (size_t)keys * 128 * 2));
+    for (uint32_t ratio = 1; ratio <= 2; ratio++) {
+        const uint32_t start = keys * ratio - rows;
+        CHECK(ds4_gpu_dsv41_indexer_scores_batch(x, q, w, f, keys, rows, start, ratio));
+        CHECK(ds4_gpu_dsv41_indexer_scores_bf16(y, q, w, h, keys, rows, start, ratio));
+        CHECK(ds4_gpu_tensor_read(x, 0, a, (size_t)keys * rows * 4));
+        CHECK(ds4_gpu_tensor_read(y, 0, b, (size_t)keys * rows * 4));
+        CHECK(!memcmp(a, b, (size_t)keys * rows * 4));
+    }
+    for (size_t i = 0; i < (size_t)keys * width; i++) {
+        kv[i] = bf16(random_value()); uint32_t bits; memcpy(&bits, &kv[i], 4); packed[i] = bits >> 16u;
+    }
+    CHECK(ds4_gpu_tensor_write(f, 0, kv, (size_t)keys * width * 4));
+    CHECK(ds4_gpu_tensor_write(h, 0, packed, (size_t)keys * width * 2));
+    for (uint32_t ratio = 1; ratio <= 2; ratio++) {
+        const uint32_t start = keys * ratio - rows;
+        CHECK(ds4_gpu_attention_indexed_mixed_batch_heads_tensor(x, sinks, getpagesize(), 0,
+            q, raw, f, 0, id, rows, start, 127u + rows, 127u + rows, 0, keys, 512, 128, ratio, heads, width));
+        CHECK(ds4_gpu_attention_indexed_mixed_batch_heads_tensor(y, sinks, getpagesize(), 0,
+            q, raw, h, 2, id, rows, start, 127u + rows, 127u + rows, 0, keys, 512, 128, ratio, heads, width));
+        CHECK(ds4_gpu_tensor_read(x, 0, a, (size_t)rows * heads * width * 4));
+        CHECK(ds4_gpu_tensor_read(y, 0, b, (size_t)rows * heads * width * 4));
+        CHECK(!memcmp(a, b, (size_t)rows * heads * width * 4));
+    }
+    ds4_gpu_tensor_free(f); ds4_gpu_tensor_free(h); ds4_gpu_tensor_free(q); ds4_gpu_tensor_free(w);
+    ds4_gpu_tensor_free(id); ds4_gpu_tensor_free(x); ds4_gpu_tensor_free(y); ds4_gpu_tensor_free(raw);
+    free(kv); free(a); free(b); free(packed); free(query); free(weights); free(ids);
+    fprintf(stderr, "V4.1 BF16 cache gather/index/attention: bitwise identical to F32 storage\n");
+    return 1;
+}
+#endif
+
 int main(int argc, char **argv) {
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    if (argc == 2 && !strcmp(argv[1], "--mask-bits")) {
+        const int ok = ds4_gpu_init() && check_mask_bits();
+        ds4_gpu_cleanup();
+        return ok ? 0 : 1;
+    }
+    if (argc == 2 && !strcmp(argv[1], "--bf16-cache")) {
+        const int ok = ds4_gpu_init() && check_bf16_cache();
+        ds4_gpu_cleanup();
+        return ok ? 0 : 1;
+    }
+#endif
     if (argc == 2 && !strcmp(argv[1], "--embedding")) {
         const int ok = ds4_gpu_init() && check_embedding();
         ds4_gpu_cleanup();

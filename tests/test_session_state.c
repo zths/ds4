@@ -529,6 +529,57 @@ static void test_glm_spec_rollback(void) {
 }
 #endif
 
+#ifdef DS4_HAS_DEEPSEEK41_GPU
+/* Closing the first borrower (or a failed new session) must not free the
+ * engine's workspace while a sibling still uses it. Exercise real tensors
+ * and views, including the alias-within-arena ownership used by prefill. */
+static void test_v41_prefill_workspace_lifetime(void) {
+    const ds4_shape saved = g_ds4_shape;
+    g_ds4_shape = DS4_SHAPE_FLASH41;
+    assert(ds4_gpu_init());
+    ds41_gpu_graph arena = {.ctx = 32, .prefill_cap = 2,
+                            .owns_prefill_workspace = true};
+    arena.batch.residual = ds4_gpu_tensor_alloc(64);
+    arena.batch.flat_norm = ds4_gpu_tensor_view(arena.batch.residual, 0, 64);
+    arena.carry.residual = ds4_gpu_tensor_alloc(64);
+    arena.raw_prefill = ds4_gpu_tensor_alloc(64);
+    arena.engram_prefetch = ds4_gpu_tensor_alloc_managed(64);
+    arena.image_text_mask = ds4_gpu_tensor_alloc_managed(64);
+    arena.prefill_tokens = ds4_gpu_tensor_alloc(64);
+    arena.prefill_ids = calloc(2, sizeof(*arena.prefill_ids));
+    assert(arena.batch.residual && arena.batch.flat_norm && arena.carry.residual &&
+           arena.raw_prefill && arena.engram_prefetch && arena.image_text_mask &&
+           arena.prefill_tokens && arena.prefill_ids);
+    assert(ds4_gpu_tensor_fill_f32(arena.batch.residual, 7, 16));
+    ds41_gpu_graph first = {0}, second = {0}, failed = {0};
+    first.table[0].fd = first.table[1].fd = -1;
+    second.table[0].fd = second.table[1].fd = -1;
+    ds41_prefill_workspace_alias(&first, &arena);
+    ds41_prefill_workspace_alias(&second, &arena);
+    first.residual = ds4_gpu_tensor_alloc(64);
+    second.residual = ds4_gpu_tensor_alloc(64);
+    assert(first.residual && second.residual);
+    assert(ds4_gpu_tensor_fill_f32(first.residual, 11, 16));
+    assert(ds4_gpu_tensor_fill_f32(second.residual, 13, 16));
+    assert(!ds41_graph_alloc(&failed, NULL, NULL, NULL, 32, false, &arena));
+    ds41_graph_free(&first);
+    float values[16];
+    assert(ds4_gpu_tensor_read(second.residual, 0, values, sizeof(values)));
+    for (unsigned i = 0; i < 16; i++) assert(values[i] == 13);
+    assert(ds4_gpu_tensor_read(second.batch.flat_norm, 0, values, sizeof(values)));
+    for (unsigned i = 0; i < 16; i++) assert(values[i] == 7);
+    ds41_graph_free(&second);
+    ds41_prefill_workspace_alias(&first, &arena);
+    assert(ds4_gpu_tensor_fill_f32(first.batch.residual, 17, 16));
+    ds41_graph_free(&first);
+    assert(ds4_gpu_tensor_read(arena.batch.flat_norm, 0, values, sizeof(values)));
+    for (unsigned i = 0; i < 16; i++) assert(values[i] == 17);
+    ds41_prefill_workspace_free(&arena);
+    ds4_gpu_cleanup();
+    g_ds4_shape = saved;
+}
+#endif
+
 int main(void) {
     test_vision_prefix();
     test_vision_fingerprint_prefix();
@@ -540,6 +591,9 @@ int main(void) {
 #ifndef DS4_NO_GPU
     test_glm_attention_budget();
     test_glm_spec_rollback();
+#endif
+#ifdef DS4_HAS_DEEPSEEK41_GPU
+    test_v41_prefill_workspace_lifetime();
 #endif
     puts("session state tests: ok");
     return 0;

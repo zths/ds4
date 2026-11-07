@@ -11,8 +11,8 @@ extern "C" {
 #endif
 
 /* Metal queues each gate on its service thread and orders GPU arrival/release
- * with events or flags. CUDA waits for its local stream and calls the exchange
- * synchronously. Callbacks return nonzero on success; both ranks must issue
+ * with events or flags. CUDA uses completion gates, or queued IPC events for
+ * resident decode. Callbacks return nonzero on success; both ranks must issue
  * the same gate sequence. Shutdown precedes transport/slab destruction. */
 typedef int (*ds4_gpu_tp_exchange_fn)(void *ud, uint32_t layer, uint32_t gate, uint64_t seq);
 typedef int (*ds4_gpu_tp_batch_exchange_fn)(void *ud, uint32_t layer,
@@ -25,6 +25,24 @@ int ds4_gpu_tp_init(uint32_t rank, ds4_gpu_tensor *slab,
                     uint64_t gpu_flags_off, uint64_t out_off, uint64_t vec_bytes,
                     ds4_gpu_tp_exchange_fn fn, void *ud);
 void ds4_gpu_tp_shutdown(void);
+/* CUDA-only same-host memory transport; callers retain the exported slab
+ * until both ranks have closed their imported handles. */
+int ds4_gpu_tp_ipc_export(const ds4_gpu_tensor *slab, void *handle);
+int ds4_gpu_tp_ipc_open(const void *handle);
+void ds4_gpu_tp_ipc_close(void);
+int ds4_gpu_tp_ipc_read(ds4_gpu_tensor *slab, uint64_t dst, uint64_t src, uint64_t bytes);
+/* Alias a non-owning scalar input view to the imported peer's output slot.
+ * The existing arrival gate and slab lifetime still bound every read. */
+int ds4_gpu_tp_ipc_alias(ds4_gpu_tensor *view, const ds4_gpu_tensor *slab, uint64_t src);
+int ds4_gpu_tp_ipc_events_export(void *handles);
+int ds4_gpu_tp_ipc_events_open(const void *handles);
+void ds4_gpu_tp_ipc_events_enable(int enabled);
+/* Shutdown closes imports first. Release exports only after transport detach
+ * confirms that the peer has closed its imports too. */
+void ds4_gpu_tp_ipc_events_release(int peer_released);
+/* Resident scalar decode only: alternate events while retaining host arrival
+ * ordering. Other schedules use the original completion gate. */
+int ds4_gpu_tp_decode_gate_encode(uint32_t layer, uint32_t gate);
 int ds4_gpu_tp_failed(void);
 int ds4_gpu_tp_gate_encode(uint32_t layer, uint32_t gate);
 void ds4_gpu_tp_set_batch_exchange(ds4_gpu_tp_batch_exchange_fn fn);

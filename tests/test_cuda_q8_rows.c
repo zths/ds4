@@ -50,7 +50,7 @@ static void check(uint32_t blocks, uint32_t outputs, uint32_t rows) {
         ds4_gpu_tensor_free(xr); ds4_gpu_tensor_free(yr);
     }
     CHECK(ds4_gpu_tensor_read(y, 0, reference, (size_t)rows * outputs * 4u));
-    const uint32_t counts[] = {1, 3, 8, 16, 127, 128, rows};
+    const uint32_t counts[] = {1, 2, 3, 8, 16, 127, 128, rows};
     for (size_t c = 0; c < sizeof(counts) / sizeof(*counts); c++) {
         if (counts[c] > rows) continue;
         CHECK(ds4_gpu_tensor_fill_f32(y, NAN, (size_t)rows * outputs));
@@ -75,6 +75,24 @@ static void check(uint32_t blocks, uint32_t outputs, uint32_t rows) {
                 CHECK(isnan(actual[i]));
         }
     }
+    /* The two-row path is also captured in the TP layer graph. Test eager,
+     * first capture and replay, including output canaries beyond both rows. */
+    const ds4_decode_graph_key key = {.il = 0, .island = 0, .variant = 99, .cur_hc = x};
+    for (unsigned pass = 0; rows >= 2 && pass < 3; pass++) {
+        CHECK(ds4_gpu_tensor_fill_f32(y, NAN, (size_t)rows * outputs));
+        const int state = ds4_gpu_decode_graph_begin(&key);
+        CHECK(state == (pass == 0 ? -1 : pass == 1 ? 0 : 1));
+        if (state != 1) {
+            CHECK(ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(y, model, bytes,
+                0, width, outputs, x, 2));
+            if (state == 0) CHECK(ds4_gpu_decode_graph_end(&key) == 0);
+        }
+        CHECK(ds4_gpu_synchronize());
+        CHECK(ds4_gpu_tensor_read(y, 0, actual, (size_t)rows * outputs * 4u));
+        CHECK(!memcmp(actual, reference, (size_t)2 * outputs * 4u));
+        for (size_t i = (size_t)2 * outputs; i < (size_t)rows * outputs; i++) CHECK(isnan(actual[i]));
+    }
+    ds4_gpu_decode_graphs_invalidate();
     fprintf(stderr, "CUDA Q8 exact rows blocks=%u outputs=%u rows=%u, unpadded weights: PASS hash=%016" PRIx64 "\n",
         blocks, outputs, rows, hash_bytes(reference, (size_t)rows * outputs * 4u));
     ds4_gpu_tensor_free(x); ds4_gpu_tensor_free(y);

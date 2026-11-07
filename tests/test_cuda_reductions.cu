@@ -1,4 +1,5 @@
 #include "ds4_gpu.h"
+#include "ds4_deepseek41_gpu.h"
 #include <cuda_runtime.h>
 #include <cmath>
 #include <cstdio>
@@ -16,7 +17,7 @@ static float random_value() {
 
 /* Independent original reduction, including its accumulation and barrier order. */
 __global__ static void reference(float *out, const float *w, const float *x,
-                                uint32_t width, uint32_t rows, bool norm) {
+                                uint32_t width, uint32_t rows, bool norm, float eps) {
     const uint32_t row = blockIdx.x, tid = threadIdx.x;
     if (row >= rows) return;
     const float *xr = norm ? x + (size_t)row * width : x;
@@ -32,13 +33,13 @@ __global__ static void reference(float *out, const float *w, const float *x,
         __syncthreads();
     }
     if (norm) {
-        const float scale = rsqrtf(partial[0] / (float)width + 1e-6f);
+        const float scale = rsqrtf(partial[0] / (float)width + eps);
         for (uint32_t i = tid; i < width; i += 256u)
             out[(size_t)row * width + i] = xr[i] * scale * wr[i];
     } else if (tid == 0u) out[row] = partial[0];
 }
 
-static void check(bool norm, uint32_t width, uint32_t rows, unsigned pattern) {
+static void check(bool norm, uint32_t width, uint32_t rows, unsigned pattern, bool bf16 = false) {
     const size_t wn = norm ? width : (size_t)width * rows;
     const size_t xn = norm ? (size_t)width * rows : width;
     const size_t yn = norm ? xn : rows;
@@ -58,14 +59,26 @@ static void check(bool norm, uint32_t width, uint32_t rows, unsigned pattern) {
     CHECK(cudaMalloc(&ref, yn * sizeof(float)) == cudaSuccess);
     CHECK(cudaMemcpy(wd, weights.data(), bytes, cudaMemcpyHostToDevice) == cudaSuccess);
     const float *xd = (const float *)ds4_gpu_tensor_contents(x);
-    reference<<<rows, 256>>>(ref, wd, xd, width, rows, norm);
+    const float eps = bf16 ? 1e-20f : 1e-6f;
+    reference<<<rows, 256>>>(ref, wd, xd, width, rows, norm, eps);
     CHECK(cudaGetLastError() == cudaSuccess);
     CHECK(cudaMemcpy(expected.data(), ref, yn * sizeof(float), cudaMemcpyDeviceToHost) == cudaSuccess);
+    if (bf16) for (float &v : expected) {
+        uint32_t bits;
+        memcpy(&bits, &v, sizeof(bits));
+        if ((bits & 0x7f800000u) != 0x7f800000u)
+            bits += 0x7fffu + ((bits >> 16u) & 1u);
+        bits &= 0xffff0000u;
+        memcpy(&v, &bits, sizeof(bits));
+    }
     for (unsigned inplace = 0; inplace < (norm ? 2u : 1u); inplace++) {
         ds4_gpu_tensor *out = inplace ? x : y;
         CHECK(ds4_gpu_tensor_fill_f32(out, NAN, yn + 8u));
         if (inplace) CHECK(ds4_gpu_tensor_write(x, 0, input.data(), xn * sizeof(float)));
-        if (norm) {
+        if (bf16) {
+            CHECK(ds4_gpu_dsv41_rms_norm_weight(out, x, weights.data(), bytes,
+                                               0, width, rows, eps));
+        } else if (norm) {
             CHECK(ds4_gpu_rms_norm_weight_rows_tensor(out, x, weights.data(), bytes,
                                                      0, width, rows, 1e-6f));
         } else {
@@ -86,19 +99,22 @@ static void check(bool norm, uint32_t width, uint32_t rows, unsigned pattern) {
     ds4_gpu_tensor_free(y);
     ds4_gpu_tensor_free(x);
     ds4_gpu_cleanup();
-    printf("CUDA reduction norm=%d width=%u rows=%u pattern=%u: exact PASS\n",
-           norm, width, rows, pattern);
+    printf("CUDA reduction norm=%d bf16=%d width=%u rows=%u pattern=%u: exact PASS\n",
+           norm, bf16, width, rows, pattern);
 }
 
 int main() {
     for (unsigned pattern = 0; pattern < 3u; pattern++) {
-        for (uint32_t width : {1u, 31u, 32u, 255u, 256u, 257u, 511u, 512u,
+        for (uint32_t width : {1u, 31u, 32u, 128u, 255u, 256u, 257u, 511u, 512u,
                                1280u, 4096u, 5120u, 16384u, 20480u}) {
             check(true, width, 1, pattern);
             check(true, width, 8, pattern);
+            check(true, width, 1, pattern, true);
+            check(true, width, 8, pattern, true);
             check(false, width, 13, pattern);
         }
         check(true, 5120, 129, pattern);
+        check(true, 5120, 129, pattern, true);
         check(false, 5120, 384, pattern);
         check(false, 4096, 256, pattern);
     }

@@ -24,6 +24,10 @@ typedef enum {
 int ds4_gpu_dsv41_quantize(ds4_gpu_tensor *x, uint32_t width, uint32_t rows,
                           ds4_v41_activation_format format);
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
+/* Same reduction and rounding as weighted RMS norm followed by BF16. */
+int ds4_gpu_dsv41_rms_norm_weight(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
+        const void *model_map, uint64_t model_size, uint64_t weight_offset,
+        uint32_t width, uint32_t rows, float eps);
 /* CUDA scalar Q8 shared expert. 1: queued; 0: unsupported, no work queued;
  * -1: failure. After 1, keep the input/output tensors alive and unchanged
  * until join, which orders the result before subsequent main-stream work.
@@ -78,6 +82,11 @@ int ds4_gpu_dsv41_candidate_filter(ds4_gpu_tensor *scores,
                                   const ds4_gpu_tensor *block_mask,
                                   uint32_t width, uint32_t rows,
                                   uint32_t start, uint32_t ratio);
+/* CUDA masks use one allow bit per eight-position block, padded to words. */
+int ds4_gpu_dsv41_candidate_mask_bits(ds4_gpu_tensor *mask,
+    const ds4_gpu_tensor *selected, uint32_t blocks, uint32_t rows, uint32_t top);
+int ds4_gpu_dsv41_candidate_filter_bits(ds4_gpu_tensor *scores,
+    const ds4_gpu_tensor *mask, uint32_t width, uint32_t rows, uint32_t start, uint32_t ratio);
 /* Causal index scores over ratio-1/2 compressed keys, without an extra cast
  * of the already quantized FP4 queries/keys. Scores have source_rows stride. */
 int ds4_gpu_dsv41_indexer_scores_batch(ds4_gpu_tensor *scores,
@@ -86,6 +95,32 @@ int ds4_gpu_dsv41_indexer_scores_batch(ds4_gpu_tensor *scores,
                                      const ds4_gpu_tensor *keys,
                                      uint32_t source_rows, uint32_t rows,
                                      uint32_t start, uint32_t ratio);
+/* CUDA compact cache readers: BF16 bits are expanded exactly into F32. */
+int ds4_gpu_dsv41_indexer_scores_bf16(ds4_gpu_tensor *scores,
+    const ds4_gpu_tensor *q, const ds4_gpu_tensor *weights, const ds4_gpu_tensor *keys,
+    uint32_t source_rows, uint32_t rows, uint32_t start, uint32_t ratio);
+int ds4_gpu_dsv41_gather_kv_bf16(ds4_gpu_tensor *out, const ds4_gpu_tensor *source,
+    const ds4_gpu_tensor *ids, uint32_t source_rows, uint32_t selected_rows);
+/* CUDA FP4 cache rows contain adjacent nibble pairs, then one byte per scale.
+ * Main KV: 512 E2M1 values + 32 E4M3 scales = 288 bytes.
+ * Index K: 128 E2M1 values + 4 E8M0 scales = 68 bytes. */
+int ds4_gpu_dsv41_cache_quantize_fp4(ds4_gpu_tensor *cache, uint32_t first,
+    const ds4_gpu_tensor *plain, uint32_t width, uint32_t rows);
+int ds4_gpu_dsv41_gather_kv_fp4(ds4_gpu_tensor *out, const ds4_gpu_tensor *source,
+    const ds4_gpu_tensor *ids, uint32_t source_rows, uint32_t selected_rows);
+int ds4_gpu_dsv41_add_bf16(ds4_gpu_tensor *out, const ds4_gpu_tensor *a,
+    const ds4_gpu_tensor *b, uint32_t count);
+/* Queries must already be rounded by DS4_V41_FP4_E8M0, as in the V4.1 graph.
+ * Native dot products retain exact F32 results; unsafe scales use its sum tree. */
+int ds4_gpu_dsv41_indexer_scores_fp4(ds4_gpu_tensor *scores,
+    const ds4_gpu_tensor *q, const ds4_gpu_tensor *weights, const ds4_gpu_tensor *keys,
+    uint32_t source_rows, uint32_t rows, uint32_t start, uint32_t ratio);
+/* CUDA scalar decoder reindexing over the existing 2,048-block candidate pool.
+ * Returns 1 when selected, 0 to retain full scoring, or -1 on a GPU error. */
+int ds4_gpu_dsv41_indexer_candidates_fp4(ds4_gpu_tensor *selected,
+    ds4_gpu_tensor *scores, ds4_gpu_tensor *scratch,
+    const ds4_gpu_tensor *q, const ds4_gpu_tensor *weights,
+    const ds4_gpu_tensor *keys, const ds4_gpu_tensor *blocks, uint32_t source_rows);
 int ds4_gpu_dsv41_tensor_ops_available(void);
 /* Reuse exact BF16 views of FP4 queries/keys across score tiles. Invalid
  * casts retain the F32 arithmetic for the affected tile. */

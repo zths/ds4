@@ -23,6 +23,84 @@ __global__ static void dsv41_bf16_kernel(float *x, uint64_t count) {
     if (i < count) x[i] = dsv41_bf16(x[i]);
 }
 
+__global__ static void dsv41_add_bf16_kernel(float *out, const float *a,
+                                            const float *b, uint32_t count) {
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < count) out[i] = dsv41_bf16(a[i] + b[i]);
+}
+
+extern "C" int ds4_gpu_dsv41_add_bf16(ds4_gpu_tensor *out,
+        const ds4_gpu_tensor *a, const ds4_gpu_tensor *b, uint32_t count) {
+    if (!dsv41_has_floats(out, count) || !dsv41_has_floats(a, count) ||
+        !dsv41_has_floats(b, count)) return 0;
+    if (!count) return 1;
+    dsv41_add_bf16_kernel<<<(unsigned)(((uint64_t)count + 255u) / 256u), 256, 0, cuda_decode_stream()>>>(
+        (float *)out->ptr, (const float *)a->ptr, (const float *)b->ptr, count);
+    return cuda_ok(cudaGetLastError(), "V4.1 add and BF16 boundary");
+}
+
+/* Keep the scalar norm's 256-thread accumulation tree and BF16 boundary.
+ * Register inputs avoid reading the vector twice. Decode can duplicate the
+ * reduction across eight CTAs to parallelize the otherwise serial writeout;
+ * this is only safe when the input and output ranges do not overlap. */
+template <uint32_t WIDTH, uint32_t COPIES = 1>
+__global__ static void dsv41_rms_norm_weight_kernel(float *out, const float *x,
+                                                   const float *w, float eps) {
+    const uint32_t t = threadIdx.x, row = blockIdx.x;
+    const float *xr = x + (uint64_t)row * WIDTH;
+    float *yr = out + (uint64_t)row * WIDTH;
+    float v[(WIDTH + 255u) / 256u];
+#pragma unroll
+    for (uint32_t j = 0; j < (WIDTH + 255u) / 256u; j++)
+        v[j] = t + j * 256u < WIDTH ? xr[t + j * 256u] : 0.0f;
+    float sum = 0.0f;
+#pragma unroll
+    for (uint32_t j = 0; j < (WIDTH + 255u) / 256u; j++) sum += v[j] * v[j];
+    __shared__ float partial[256];
+    sum = block_sum_f32_256(sum, partial);
+    const float scale = rsqrtf(sum / (float)WIDTH + eps);
+#pragma unroll
+    for (uint32_t j = COPIES == 1u ? 0u : blockIdx.y;
+         j < (WIDTH + 255u) / 256u; j += COPIES) {
+        const uint32_t i = t + j * 256u;
+        if (i < WIDTH) yr[i] = dsv41_bf16(v[j] * scale * w[i]);
+    }
+}
+
+extern "C" int ds4_gpu_dsv41_rms_norm_weight(ds4_gpu_tensor *out,
+        const ds4_gpu_tensor *x, const void *model_map, uint64_t model_size,
+        uint64_t offset, uint32_t width, uint32_t rows, float eps) {
+    const uint64_t count = (uint64_t)width * rows;
+    if (!width || !rows || rows > INT32_MAX || !model_map || offset > model_size ||
+        model_size - offset < (uint64_t)width * sizeof(float) ||
+        !dsv41_has_floats(out, count) || !dsv41_has_floats(x, count)) return 0;
+    if (width != 128u && width != 512u && width != 1280u && width != 5120u)
+        return ds4_gpu_rms_norm_weight_rows_tensor(out, x, model_map, model_size,
+                   offset, width, rows, eps) &&
+               ds4_gpu_dsv41_quantize(out, width, rows, DS4_V41_BF16);
+    const float *w = (const float *)cuda_resolve_weight_ptr(model_map, offset,
+        (uint64_t)width * sizeof(float), ds4_tensor_device_idx(out), "V4.1 rms weight");
+    if (!w) return 0;
+    const uintptr_t dst = (uintptr_t)out->ptr, src = (uintptr_t)x->ptr;
+    if (width == 5120u && rows == 1u &&
+        (dst + count * sizeof(float) <= src || src + count * sizeof(float) <= dst)) {
+        dsv41_rms_norm_weight_kernel<5120, 8><<<dim3(1, 8), 256, 0, cuda_decode_stream()>>>(
+            (float *)out->ptr, (const float *)x->ptr, w, eps);
+    } else {
+#define DSV41_NORM_WIDTH(N) case N: \
+        dsv41_rms_norm_weight_kernel<N><<<rows, 256, 0, cuda_decode_stream()>>>( \
+            (float *)out->ptr, (const float *)x->ptr, w, eps); break
+        switch (width) {
+            DSV41_NORM_WIDTH(128);
+            DSV41_NORM_WIDTH(512);
+            DSV41_NORM_WIDTH(1280);
+            DSV41_NORM_WIDTH(5120);
+        }
+#undef DSV41_NORM_WIDTH
+    }
+    return cuda_ok(cudaGetLastError(), "V4.1 fused RMS norm");
+}
+
 __global__ static void dsv41_quantize_kernel(float *x, uint32_t width,
                                             uint32_t rows, uint32_t mode) {
     const uint32_t block = mode == DS4_V41_FP4_E4M3 ? 16u : 32u;
@@ -59,6 +137,61 @@ extern "C" int ds4_gpu_dsv41_quantize(ds4_gpu_tensor *x, uint32_t width,
         dsv41_quantize_kernel<<<(unsigned)((count / block + 7u) / 8u), 256, 0, cuda_decode_stream()>>>(
             (float *)x->ptr, width, rows, format);
     return cuda_ok(cudaGetLastError(), "V4.1 activation rounding");
+}
+
+/* Store the codes/scales at the original quantization boundary. There is no
+ * re-quantization of expanded cache data and no full-cache float mirror. */
+__global__ static void dsv41_cache_quantize_fp4_kernel(uint8_t *cache,
+        const float *x, uint32_t width, uint32_t rows, uint32_t first) {
+    const uint32_t block = width == 512u ? 16u : 32u;
+    const uint32_t groups_per_row = width / block;
+    const uint64_t group = (uint64_t)blockIdx.x * 8u + threadIdx.x / 32u;
+    const uint32_t lane = threadIdx.x & 31u;
+    if (group >= (uint64_t)rows * groups_per_row) return;
+    const uint64_t i = group * block + lane;
+    const float value = lane < block ? dsv41_bf16(x[i]) : 0.0f;
+    const float peak = __shfl_sync(0xffffffffu, warp_max_f32(fabsf(value)), 0);
+    const float scale = width == 512u ?
+        dsv4_e4m3fn_dequant_dev(__fdiv_rn(fmaxf(peak, 0.01171875f), 6.0f)) :
+        dsv41_pow2_ceil(__fmul_rn(fmaxf(peak, 0x1.8p-124f), 1.0f / 6.0f));
+    const float ax = fminf(__fdiv_rn(fabsf(value), scale), 6.0f);
+    uint32_t code = 0;
+    float distance = ax;
+#pragma unroll
+    for (uint32_t c = 1; c < 8u; c++) {
+        const float d = fabsf(ax - dsv4_e2m1fn_value_dev(c));
+        if (d < distance || (d == distance && !(c & 1u) && (code & 1u))) {
+            code = c; distance = d;
+        }
+    }
+    code |= (__float_as_uint(value) >> 28u) & 8u;
+    const uint32_t next = __shfl_down_sync(0xffffffffu, code, 1u);
+    uint8_t *out = cache + (first + group / groups_per_row) *
+        (width / 2u + groups_per_row);
+    const uint32_t col = (group % groups_per_row) * block + lane;
+    if (lane < block && !(lane & 1u)) out[col / 2u] = code | (next << 4u);
+    if (!lane) {
+        const uint32_t bits = __float_as_uint(scale);
+        const uint32_t sc = width == 128u ? bits >> 23u :
+            (scale < 0.015625f ? (uint32_t)(scale * 512.0f) :
+             ((bits >> 23u) - 120u) * 8u + ((bits >> 20u) & 7u));
+        out[width / 2u + group % groups_per_row] = sc;
+    }
+}
+
+extern "C" int ds4_gpu_dsv41_cache_quantize_fp4(ds4_gpu_tensor *cache,
+        uint32_t first, const ds4_gpu_tensor *plain, uint32_t width, uint32_t rows) {
+    if ((width != 128u && width != 512u) || !rows || rows > UINT32_MAX - first ||
+        !cache || !cache->ptr || cache == plain ||
+        !dsv41_has_floats(plain, (uint64_t)width * rows)) return 0;
+    const uint32_t row_bytes = width == 512u ? 288u : 68u;
+    const uint64_t groups = (uint64_t)rows * width / (width == 512u ? 16u : 32u);
+    if (cache->bytes < (uint64_t)(first + rows) * row_bytes ||
+        (groups + 7u) / 8u > INT32_MAX) return 0;
+    dsv41_cache_quantize_fp4_kernel<<<(unsigned)((groups + 7u) / 8u), 256,
+        0, cuda_decode_stream()>>>((uint8_t *)cache->ptr, (const float *)plain->ptr,
+                                   width, rows, first);
+    return cuda_ok(cudaGetLastError(), "V4.1 packed FP4 cache store");
 }
 
 extern "C" int ds4_gpu_dsv41_shared_join(void) {
@@ -255,6 +388,7 @@ extern "C" int ds4_gpu_dsv41_pool2(ds4_gpu_tensor *out, const ds4_gpu_tensor *kv
          ds4_gpu_tensor_copy(prev_scores, 0, scores, (last_even - start) * bytes, bytes));
 }
 
+template <bool MASK_BITS = false>
 __global__ static void dsv41_candidates_kernel(float *out, const float *scores,
                                                const float *mask, uint32_t width,
                                                uint32_t rows, uint32_t start, uint32_t ratio) {
@@ -264,7 +398,11 @@ __global__ static void dsv41_candidates_kernel(float *out, const float *scores,
     const uint32_t row = i / out_width, col = i % out_width;
     const uint32_t visible = min(width, (start + row + 1u) / ratio);
     if (mask) {
-        out[i] = col < visible && mask[(uint64_t)row * blocks + col / 8u] == 0.0f ? scores[i] : -INFINITY;
+        const bool allowed = MASK_BITS ?
+            (((const uint32_t *)mask)[(uint64_t)row * ((blocks + 31u) / 32u) + col / 256u] &
+             (1u << ((col / 8u) & 31u))) != 0 :
+            mask[(uint64_t)row * blocks + col / 8u] == 0.0f;
+        out[i] = col < visible && allowed ? scores[i] : -INFINITY;
     } else {
         float best = -INFINITY;
         for (uint32_t j = col * 8u; j < min(visible, (col + 1u) * 8u); j++)
@@ -276,16 +414,21 @@ __global__ static void dsv41_candidates_kernel(float *out, const float *scores,
 
 static int dsv41_candidates(ds4_gpu_tensor *out, const ds4_gpu_tensor *scores,
                             const ds4_gpu_tensor *mask, uint32_t width, uint32_t rows,
-                            uint32_t start, uint32_t ratio) {
+                            uint32_t start, uint32_t ratio, bool mask_bits = false) {
     if (!width || width > UINT32_MAX - 7u || !rows || !ratio || rows > UINT32_MAX - start) return 0;
     const uint32_t blocks = (width + 7u) / 8u;
     const uint64_t count = (uint64_t)(mask ? width : blocks) * rows;
     if (!dsv41_has_floats(scores, (uint64_t)width * rows) || !dsv41_has_floats(out, count) ||
-        (mask && !dsv41_has_floats(mask, (uint64_t)blocks * rows)) ||
+        (mask && !dsv41_has_floats(mask, (uint64_t)(mask_bits ? (blocks + 31u) / 32u : blocks) * rows)) ||
         (count + 255u) / 256u > INT32_MAX) return 0;
-    dsv41_candidates_kernel<<<(unsigned)((count + 255u) / 256u), 256, 0, cuda_decode_stream()>>>(
-        (float *)out->ptr, (const float *)scores->ptr, mask ? (const float *)mask->ptr : NULL,
-        width, rows, start, ratio);
+    if (mask_bits)
+        dsv41_candidates_kernel<true><<<(unsigned)((count + 255u) / 256u), 256, 0, cuda_decode_stream()>>>(
+            (float *)out->ptr, (const float *)scores->ptr, (const float *)mask->ptr,
+            width, rows, start, ratio);
+    else
+        dsv41_candidates_kernel<<<(unsigned)((count + 255u) / 256u), 256, 0, cuda_decode_stream()>>>(
+            (float *)out->ptr, (const float *)scores->ptr, mask ? (const float *)mask->ptr : NULL,
+            width, rows, start, ratio);
     return cuda_ok(cudaGetLastError(), "V4.1 sparse candidates");
 }
 
@@ -297,6 +440,36 @@ extern "C" int ds4_gpu_dsv41_candidate_blocks(ds4_gpu_tensor *out, const ds4_gpu
 extern "C" int ds4_gpu_dsv41_candidate_filter(ds4_gpu_tensor *scores, const ds4_gpu_tensor *mask,
                                               uint32_t width, uint32_t rows, uint32_t start, uint32_t ratio) {
     return mask && dsv41_candidates(scores, scores, mask, width, rows, start, ratio);
+}
+
+__global__ static void dsv41_mask_bits_kernel(uint32_t *mask, const uint32_t *selected,
+                                               uint32_t blocks, uint32_t top) {
+    const uint32_t words = (blocks + 31u) / 32u;
+    mask += (uint64_t)blockIdx.x * words;
+    selected += (uint64_t)blockIdx.x * top;
+    for (uint32_t word = threadIdx.x; word < words; word += blockDim.x) mask[word] = 0;
+    __syncthreads();
+    for (uint64_t i = threadIdx.x; i < top; i += blockDim.x) {
+        const uint32_t id = selected[i];
+        if (id < blocks) atomicOr(mask + id / 32u, 1u << (id & 31u));
+    }
+}
+
+extern "C" int ds4_gpu_dsv41_candidate_mask_bits(ds4_gpu_tensor *mask,
+    const ds4_gpu_tensor *selected, uint32_t blocks, uint32_t rows, uint32_t top) {
+    if (!blocks || blocks > UINT32_MAX - 31u || !rows || rows > INT32_MAX || !top) return 0;
+    const uint64_t words = (uint64_t)((blocks + 31u) / 32u) * rows, n = (uint64_t)rows * top;
+    if (!dsv41_has_floats(mask, words) || !dsv41_has_floats(selected, n)) return 0;
+    /* Scatter the selected IDs instead of searching the entire top-k list
+     * once for every possible block. Duplicate IDs remain harmless. */
+    dsv41_mask_bits_kernel<<<rows, 256, 0, cuda_decode_stream()>>>(
+        (uint32_t *)mask->ptr, (const uint32_t *)selected->ptr, blocks, top);
+    return cuda_ok(cudaGetLastError(), "V4.1 candidate mask bits");
+}
+
+extern "C" int ds4_gpu_dsv41_candidate_filter_bits(ds4_gpu_tensor *scores,
+    const ds4_gpu_tensor *mask, uint32_t width, uint32_t rows, uint32_t start, uint32_t ratio) {
+    return mask && dsv41_candidates(scores, scores, mask, width, rows, start, ratio, true);
 }
 
 __global__ static void dsv41_carry_kernel(uint32_t *packed, float *plain,
@@ -336,12 +509,15 @@ extern "C" int ds4_gpu_dsv41_carry_copy(ds4_gpu_tensor *packed, uint32_t offset,
     return cuda_ok(cudaGetLastError(), "V4.1 compact carry");
 }
 
+template <uint32_t FORMAT = 0>
 __global__ static void dsv41_gather_kernel(float *out, const float *source,
                                           const int32_t *ids, uint32_t source_rows) {
-    const int32_t id = ids[blockIdx.x];
+    const int32_t id = ids ? ids[blockIdx.x] : (int32_t)blockIdx.x;
     for (uint32_t col = threadIdx.x; col < 512u; col += blockDim.x)
         out[(uint64_t)blockIdx.x * 512u + col] = id >= 0 && (uint32_t)id < source_rows ?
-            source[(uint64_t)id * 512u + col] : NAN;
+            (FORMAT == 3u ? dsv41_fp4_cache_value((const uint8_t *)source + (uint64_t)id * 288u, col, 512u) :
+             FORMAT == 2u ? __uint_as_float((uint32_t)((const uint16_t *)source)[(uint64_t)id * 512u + col] << 16u) :
+             source[(uint64_t)id * 512u + col]) : NAN;
 }
 
 extern "C" int ds4_gpu_dsv41_gather_kv(ds4_gpu_tensor *out, const ds4_gpu_tensor *source,
@@ -354,8 +530,29 @@ extern "C" int ds4_gpu_dsv41_gather_kv(ds4_gpu_tensor *out, const ds4_gpu_tensor
     return cuda_ok(cudaGetLastError(), "V4.1 sparse KV gather");
 }
 
+extern "C" int ds4_gpu_dsv41_gather_kv_bf16(ds4_gpu_tensor *out, const ds4_gpu_tensor *source,
+                                       const ds4_gpu_tensor *ids, uint32_t source_rows, uint32_t selected_rows) {
+    if (!source_rows || !selected_rows || selected_rows > 512u || selected_rows > source_rows ||
+        (!source || source->bytes < (uint64_t)source_rows * 512u * 2u) ||
+        !dsv41_has_floats(out, (uint64_t)selected_rows * 512u) || !dsv41_has_floats(ids, selected_rows)) return 0;
+    dsv41_gather_kernel<2><<<selected_rows, 256, 0, cuda_decode_stream()>>>((float *)out->ptr,
+        (const float *)source->ptr, (const int32_t *)ids->ptr, source_rows);
+    return cuda_ok(cudaGetLastError(), "V4.1 sparse KV gather");
+}
+
+extern "C" int ds4_gpu_dsv41_gather_kv_fp4(ds4_gpu_tensor *out, const ds4_gpu_tensor *source,
+                                       const ds4_gpu_tensor *ids, uint32_t source_rows, uint32_t selected_rows) {
+    if (!source_rows || !selected_rows || selected_rows > 512u || selected_rows > source_rows ||
+        (!source || source->bytes < (uint64_t)source_rows * 288u) ||
+        !dsv41_has_floats(out, (uint64_t)selected_rows * 512u) || (ids && !dsv41_has_floats(ids, selected_rows))) return 0;
+    dsv41_gather_kernel<3><<<selected_rows, 256, 0, cuda_decode_stream()>>>((float *)out->ptr,
+        (const float *)source->ptr, ids ? (const int32_t *)ids->ptr : NULL, source_rows);
+    return cuda_ok(cudaGetLastError(), "V4.1 packed FP4 KV gather");
+}
+
 /* A warp owns one score. Preserve the 128-lane reduction tree, but keep
  * all partials in registers instead of synchronizing a block per head. */
+template <uint32_t FORMAT = 0>
 __global__ static void dsv41_index_scores_kernel(float *scores, const float *q,
         const float *weights, const float *keys, uint32_t width,
         uint32_t start, uint32_t ratio) {
@@ -366,8 +563,21 @@ __global__ static void dsv41_index_scores_kernel(float *scores, const float *q,
         if (!lane) scores[(uint64_t)row * width + key] = -INFINITY;
         return;
     }
-    const float *k = keys + (uint64_t)key * 128u + lane;
-    const float k0 = k[0], k1 = k[32], k2 = k[64], k3 = k[96];
+    const uint64_t ki = (uint64_t)key * 128u + lane;
+    const float *k = keys + ki;
+    const uint16_t *kb = (const uint16_t *)keys + ki;
+    const float k0 = FORMAT == 3u ? dsv41_fp4_cache_value(
+        (const uint8_t *)keys + (uint64_t)key * 68u, lane + 0u, 128u) :
+        FORMAT == 2u ? __uint_as_float((uint32_t)kb[0] << 16u) : k[0];
+    const float k1 = FORMAT == 3u ? dsv41_fp4_cache_value(
+        (const uint8_t *)keys + (uint64_t)key * 68u, lane + 32u, 128u) :
+        FORMAT == 2u ? __uint_as_float((uint32_t)kb[32] << 16u) : k[32];
+    const float k2 = FORMAT == 3u ? dsv41_fp4_cache_value(
+        (const uint8_t *)keys + (uint64_t)key * 68u, lane + 64u, 128u) :
+        FORMAT == 2u ? __uint_as_float((uint32_t)kb[64] << 16u) : k[64];
+    const float k3 = FORMAT == 3u ? dsv41_fp4_cache_value(
+        (const uint8_t *)keys + (uint64_t)key * 68u, lane + 96u, 128u) :
+        FORMAT == 2u ? __uint_as_float((uint32_t)kb[96] << 16u) : k[96];
     float total = 0;
     for (uint32_t h = 0; h < 32u; h++) {
         const float *x = q + ((uint64_t)row * 32u + h) * 128u + lane;
@@ -379,6 +589,80 @@ __global__ static void dsv41_index_scores_kernel(float *scores, const float *q,
         total += fmaxf(dot, 0.0f) * weights[(uint64_t)row * 32u + h];
     }
     if (!lane) scores[(uint64_t)row * width + key] = total * (1.0f / 64.0f);
+}
+
+/* Long index scans are limited by L1 load/shuffle issue, not DRAM bandwidth.
+ * Four lanes reuse each query for four keys. Fold the high reduction strides
+ * in registers, then shuffle the last two: the original sum tree and ordered
+ * head accumulation are unchanged. Small scans retain the lower-latency warp
+ * kernel. This uses registers only and does not enlarge the persistent cache. */
+template <uint32_t FORMAT>
+__global__ static void dsv41_index_scores_tiled_kernel(float *scores, const float *q,
+        const float *weights, const float *keys, uint32_t width,
+        uint32_t start, uint32_t ratio) {
+    const uint32_t key0 = blockIdx.x * 128u + threadIdx.x / 4u;
+    const uint32_t row = blockIdx.y, lane = threadIdx.x & 3u;
+    const uint32_t visible = (start + row + 1u) / ratio;
+    float k[4][32];
+#pragma unroll
+    for (uint32_t z = 0; z < 4u; z++) {
+        const uint32_t key = key0 + z * 32u;
+#pragma unroll
+        for (uint32_t j = 0; j < 32u; j++) {
+            const uint64_t i = (uint64_t)key * 128u + lane + j * 4u;
+            k[z][j] = key < visible ? (FORMAT == 3u ? dsv41_fp4_cache_value(
+                (const uint8_t *)keys + (uint64_t)key * 68u, lane + j * 4u, 128u) : FORMAT == 2u ?
+                __uint_as_float((uint32_t)((const uint16_t *)keys)[i] << 16u) : keys[i]) : 0.0f;
+        }
+    }
+    float total[4] = {0};
+#pragma unroll 1
+    for (uint32_t h = 0; h < 32u; h++) {
+        const float *x = q + ((uint64_t)row * 32u + h) * 128u + lane;
+        float xv[32];
+#pragma unroll
+        for (uint32_t j = 0; j < 32u; j++) xv[j] = x[j * 4u];
+#pragma unroll
+        for (uint32_t z = 0; z < 4u; z++) {
+            float v[8];
+#pragma unroll
+            for (uint32_t j = 0; j < 8u; j++) {
+                const float a = __fadd_rn(__fmul_rn(xv[j], k[z][j]),
+                                         __fmul_rn(xv[j + 16u], k[z][j + 16u]));
+                const float b = __fadd_rn(__fmul_rn(xv[j + 8u], k[z][j + 8u]),
+                                         __fmul_rn(xv[j + 24u], k[z][j + 24u]));
+                v[j] = __fadd_rn(a, b);
+            }
+#pragma unroll
+            for (uint32_t s = 4u; s; s >>= 1u) {
+#pragma unroll
+                for (uint32_t j = 0; j < s; j++) v[j] = __fadd_rn(v[j], v[j + s]);
+            }
+            float dot = v[0];
+#pragma unroll
+            for (uint32_t s = 2u; s; s >>= 1u)
+                dot += __shfl_down_sync(0xffffffffu, dot, s, 4);
+            total[z] += fmaxf(dot, 0.0f) * weights[(uint64_t)row * 32u + h];
+        }
+    }
+#pragma unroll
+    for (uint32_t z = 0; z < 4u; z++) {
+        const uint32_t key = key0 + z * 32u;
+        if (!lane && key < width) scores[(uint64_t)row * width + key] =
+            key < visible ? total[z] * (1.0f / 64.0f) : -INFINITY;
+    }
+}
+
+template <uint32_t FORMAT>
+static void dsv41_index_scores_launch(float *scores, const float *q,
+        const float *weights, const float *keys, uint32_t width,
+        uint32_t rows, uint32_t start, uint32_t ratio) {
+    if (width >= 32768u)
+        dsv41_index_scores_tiled_kernel<FORMAT><<<dim3((width + 127u) / 128u, rows),
+            128, 0, cuda_decode_stream()>>>(scores, q, weights, keys, width, start, ratio);
+    else
+        dsv41_index_scores_kernel<FORMAT><<<dim3((width + 7u) / 8u, rows),
+            256, 0, cuda_decode_stream()>>>(scores, q, weights, keys, width, start, ratio);
 }
 
 extern "C" int ds4_gpu_dsv41_indexer_scores_batch(ds4_gpu_tensor *scores,
@@ -393,10 +677,238 @@ extern "C" int ds4_gpu_dsv41_indexer_scores_batch(ds4_gpu_tensor *scores,
         !dsv41_has_floats(keys, (uint64_t)source_rows * 128u)) return 0;
     /* FP4 with power-of-two scales can exceed FP16's exponent range.
      * Do not pass these already-quantized values through the GLM FP16 tile. */
-    dsv41_index_scores_kernel<<<dim3((source_rows + 7u) / 8u, rows), 256, 0, cuda_decode_stream()>>>(
+    dsv41_index_scores_launch<0>(
         (float *)scores->ptr, (const float *)q->ptr, (const float *)weights->ptr,
-        (const float *)keys->ptr, source_rows, start, ratio);
+        (const float *)keys->ptr, source_rows, rows, start, ratio);
     return cuda_ok(cudaGetLastError(), "V4.1 index scores");
+}
+
+extern "C" int ds4_gpu_dsv41_indexer_scores_bf16(ds4_gpu_tensor *scores,
+                                                   const ds4_gpu_tensor *q, const ds4_gpu_tensor *weights,
+                                                   const ds4_gpu_tensor *keys, uint32_t source_rows,
+                                                   uint32_t rows, uint32_t start, uint32_t ratio) {
+    if ((ratio != 1u && ratio != 2u) || !source_rows || source_rows > INT32_MAX || !rows ||
+        rows > 65535u || rows > UINT32_MAX - start || (start + rows) / ratio > source_rows ||
+        !dsv41_has_floats(scores, (uint64_t)source_rows * rows) ||
+        !dsv41_has_floats(q, (uint64_t)rows * 32u * 128u) ||
+        !dsv41_has_floats(weights, (uint64_t)rows * 32u) ||
+        (!keys || keys->bytes < (uint64_t)source_rows * 128u * 2u)) return 0;
+    /* FP4 with power-of-two scales can exceed FP16's exponent range.
+     * Do not pass these already-quantized values through the GLM FP16 tile. */
+    dsv41_index_scores_launch<2>(
+        (float *)scores->ptr, (const float *)q->ptr, (const float *)weights->ptr,
+        (const float *)keys->ptr, source_rows, rows, start, ratio);
+    return cuda_ok(cudaGetLastError(), "V4.1 index scores");
+}
+
+
+#if defined(DS4_CUDA_HAVE_MXF4)
+/* Native E2M1/E8M0 multiplication with a sufficient exactness bound. Queries
+ * already follow the released FP4 grid. Repacking them cannot change normal
+ * on-grid values; unsafe scale ranges use the original F32 reduction below. */
+__device__ static float dsv41_index_fp4_reference(const float *q,const float *w,const uint8_t *k) {
+    const unsigned lane=threadIdx.x&31;
+    float kv[4];for(unsigned j=0;j<4;j++)kv[j]=dsv41_fp4_cache_value(k,lane+j*32,128u);
+    float total=0;
+    for(unsigned h=0;h<32;h++) {
+        const float *x=q+h*128+lane;
+        float a=__fadd_rn(__fmul_rn(x[0],kv[0]),__fmul_rn(x[64],kv[2]));
+        float b=__fadd_rn(__fmul_rn(x[32],kv[1]),__fmul_rn(x[96],kv[3]));
+        float dot=__fadd_rn(a,b);
+        for(unsigned s=16;s;s>>=1)dot+=__shfl_down_sync(0xffffffffu,dot,s);
+        total+=fmaxf(dot,0)*w[h];
+    }
+    return total*(1.f/64);
+}
+template <bool COMPACT>
+__device__ static __forceinline__ unsigned dsv41_index_key(unsigned slot, const uint32_t *blocks) {
+    return COMPACT ? blocks[slot >> 3u] * 8u + (slot & 7u) : slot;
+}
+template <bool COMPACT = false>
+__global__ static void dsv41_index_fp4_mma_kernel(float *out,const uint8_t *keys,const uint8_t *queries,
+        const float *q,const float *weights,unsigned width,unsigned start,unsigned ratio,
+        const uint32_t *blocks) {
+    const uint32_t row=blockIdx.y;
+    const uint32_t visible=(start+row+1u)/ratio;
+    queries+=(uint64_t)row*32u*68u;
+    q+=(uint64_t)row*32u*128u;
+    weights+=(uint64_t)row*32u;
+    out+=(uint64_t)row*width;
+    const unsigned lane=threadIdx.x&31,warp=threadIdx.x/32,key0=blockIdx.x*64+warp*16;
+    const unsigned r=lane/4,c=lane%4;
+    const unsigned key_l=dsv41_index_key<COMPACT>(key0+(lane&15u),blocks);
+    const unsigned key_a=dsv41_index_key<COMPACT>(key0+r,blocks);
+    const unsigned key_b=dsv41_index_key<COMPACT>(key0+r+8u,blocks);
+    __shared__ float dots[4][16][32];
+    unsigned qmin=255,qmax=0;
+    for(unsigned j=0;j<4;j++){unsigned sc=queries[lane*68+64+j];qmin=min(qmin,sc);qmax=max(qmax,sc);}
+    for(unsigned s=16;s;s>>=1){qmin=min(qmin,__shfl_down_sync(0xffffffffu,qmin,s));qmax=max(qmax,__shfl_down_sync(0xffffffffu,qmax,s));}
+    qmin=__shfl_sync(0xffffffffu,qmin,0);qmax=__shfl_sync(0xffffffffu,qmax,0);
+    unsigned kmin=255,kmax=0;
+    if(lane<16&&key_l<visible)for(unsigned j=0;j<4;j++){unsigned sc=keys[(uint64_t)key_l*68+64+j];kmin=min(kmin,sc);kmax=max(kmax,sc);}
+    /* 128 products of signed half-integers: absolute integer sum <= 18432.
+     * <= 9 scale bits leaves every partial sum exactly representable in F32.
+     * Exponent bounds also exclude operand underflow and dot overflow. */
+    bool safe=qmin>=3&&qmax<=249&&kmin>=3&&kmax<=249&&
+        qmax+kmax-qmin-kmin<=9&&qmin+kmin>=130&&qmax+kmax<=367;
+    unsigned bad=__ballot_sync(0xffffffffu,lane<16&&key_l<visible&&!safe);
+    const uint8_t *ka=keys+(uint64_t)(key_a<visible?key_a:0)*68;
+    const uint8_t *kb=keys+(uint64_t)(key_b<visible?key_b:0)*68;
+    const unsigned scale_row=dsv41_index_key<COMPACT>(key0+r+(lane%2)*8,blocks);
+    const uint8_t *ks=keys+(uint64_t)(scale_row<visible?scale_row:0)*68;
+    unsigned A[2][4],AS[2];
+    for(unsigned t=0;t<2;t++) {
+        unsigned off=t*32+c*4;
+        A[t][0]=key_a<visible?*(const uint32_t *)(ka+off):0;
+        A[t][1]=key_b<visible?*(const uint32_t *)(kb+off):0;
+        A[t][2]=key_a<visible?*(const uint32_t *)(ka+off+16):0;
+        A[t][3]=key_b<visible?*(const uint32_t *)(kb+off+16):0;
+        AS[t]=scale_row<visible?*(const uint16_t *)(ks+64+t*2):0x7f7f;
+    }
+    for(unsigned head0=0;head0<32;head0+=8) {
+        float d0=0,d1=0,d2=0,d3=0;
+        const uint8_t *qr=queries+(head0+r)*68;
+        for(unsigned t=0;t<2;t++) {
+            unsigned off=t*32+c*4;
+            unsigned B0=*(const uint32_t *)(qr+off),B1=*(const uint32_t *)(qr+off+16);
+            unsigned BS=*(const uint16_t *)(qr+64+t*2);
+            asm volatile(
+                "mma.sync.aligned.kind::mxf4.block_scale.scale_vec::2X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue8m0 "
+                "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3}, %10,{0,0},%11,{0,0};"
+                : "+f"(d0),"+f"(d1),"+f"(d2),"+f"(d3)
+                : "r"(A[t][0]),"r"(A[t][1]),"r"(A[t][2]),"r"(A[t][3]),"r"(B0),"r"(B1),"r"(AS[t]),"r"(BS));
+        }
+        dots[warp][r][head0+c*2]=d0;dots[warp][r][head0+c*2+1]=d1;
+        dots[warp][r+8][head0+c*2]=d2;dots[warp][r+8][head0+c*2+1]=d3;
+    }
+    __syncwarp();
+    if(lane<16&&key0+lane<width) {
+        float total=0;
+        for(unsigned h=0;h<32;h++)total+=fmaxf(dots[warp][lane][h],0)*weights[h];
+        out[key0+lane]=key_l<visible?total*(1.f/64):-INFINITY;
+    }
+    while(bad) {
+        unsigned slot=__ffs(bad)-1;bad&=bad-1;
+        float total=dsv41_index_fp4_reference(q,weights,
+            keys+(uint64_t)dsv41_index_key<COMPACT>(key0+slot,blocks)*68);
+        if(!lane)out[key0+slot]=total;
+    }
+}
+#endif
+
+extern "C" int ds4_gpu_dsv41_indexer_scores_fp4(ds4_gpu_tensor *scores,
+                                                   const ds4_gpu_tensor *q, const ds4_gpu_tensor *weights,
+                                                   const ds4_gpu_tensor *keys, uint32_t source_rows,
+                                                   uint32_t rows, uint32_t start, uint32_t ratio) {
+    if ((ratio != 1u && ratio != 2u) || !source_rows || source_rows > INT32_MAX || !rows ||
+        rows > 65535u || rows > UINT32_MAX - start || (start + rows) / ratio > source_rows ||
+        !dsv41_has_floats(scores, (uint64_t)source_rows * rows) ||
+        !dsv41_has_floats(q, (uint64_t)rows * 32u * 128u) ||
+        !dsv41_has_floats(weights, (uint64_t)rows * 32u) ||
+        (!keys || keys->bytes < (uint64_t)source_rows * 68u)) return 0;
+    /* FP4 with power-of-two scales can exceed FP16's exponent range.
+     * Do not pass these already-quantized values through the GLM FP16 tile. */
+#if defined(DS4_CUDA_HAVE_MXF4)
+    if (g_device_is_sm120 && source_rows >= 512u &&
+        !getenv("DS4_CUDA_NO_V41_FP4_MMA")) {
+        const uint64_t bytes = (uint64_t)rows * 32u * 68u;
+        ds4_gpu_tensor packed = *q;
+        packed.ptr = cuda_tmp_alloc_on(ds4_tensor_device_idx(q), bytes, "V4.1 FP4 index queries");
+        packed.bytes = bytes;
+        if (!packed.ptr || !ds4_gpu_dsv41_cache_quantize_fp4(&packed, 0, q, 128u, rows * 32u)) return 0;
+        dsv41_index_fp4_mma_kernel<false><<<dim3((source_rows + 63u) / 64u, rows),
+            128, 0, cuda_decode_stream()>>>((float *)scores->ptr,
+                (const uint8_t *)keys->ptr, (const uint8_t *)packed.ptr,
+                (const float *)q->ptr, (const float *)weights->ptr, source_rows, start, ratio, NULL);
+        return cuda_ok(cudaGetLastError(), "V4.1 native FP4 index scores");
+    }
+#endif
+    dsv41_index_scores_launch<3>(
+        (float *)scores->ptr, (const float *)q->ptr, (const float *)weights->ptr,
+        (const float *)keys->ptr, source_rows, rows, start, ratio);
+    return cuda_ok(cudaGetLastError(), "V4.1 FP4 index scores");
+}
+
+
+#if defined(DS4_CUDA_HAVE_MXF4)
+__global__ static void dsv41_candidate_order_kernel(uint32_t *ordered, uint32_t *unsafe,
+        const uint32_t *blocks, uint32_t block_count) {
+    using Sort = cub::BlockRadixSort<uint32_t, 256, 8>;
+    __shared__ typename Sort::TempStorage temp;
+    uint32_t values[8];
+#pragma unroll
+    for (unsigned j = 0; j < 8; j++) values[j] = blocks[threadIdx.x * 8u + j];
+    Sort(temp).Sort(values);
+#pragma unroll
+    for (unsigned j = 0; j < 8; j++) ordered[threadIdx.x * 8u + j] = values[j];
+    __syncthreads();
+#pragma unroll
+    for (unsigned j = 0; j < 8; j++) {
+        const unsigned i = threadIdx.x * 8u + j;
+        if (values[j] >= block_count || (i && ordered[i - 1u] == values[j]))
+            atomicOr(unsafe, 1u);
+    }
+}
+
+__global__ static void dsv41_candidate_scores_check_kernel(uint32_t *unsafe,
+        const float *scores, const uint32_t *ordered, uint32_t source_rows) {
+    const unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= 16384u || dsv41_index_key<true>(i, ordered) >= source_rows) return;
+    const uint32_t bits = __float_as_uint(scores[i]) & 0x7fffffffu;
+    /* The full tree deliberately preserves its legacy exceptional-value
+     * behavior. Compacting that tree is safe only for finite, non-subnormal
+     * scores. With >=16,377 valid candidates, masked -Inf rows cannot win. */
+    if (bits >= 0x7f800000u || (bits && bits < 0x00800000u)) atomicOr(unsafe, 1u);
+}
+
+__global__ static void dsv41_candidate_remap_kernel(uint32_t *ids, const uint32_t *ordered) {
+    const unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < 512u) ids[i] = dsv41_index_key<true>(ids[i], ordered);
+}
+#endif
+
+extern "C" int ds4_gpu_dsv41_indexer_candidates_fp4(ds4_gpu_tensor *selected,
+        ds4_gpu_tensor *scores, ds4_gpu_tensor *scratch,
+        const ds4_gpu_tensor *q, const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *keys, const ds4_gpu_tensor *blocks, uint32_t source_rows) {
+#if defined(DS4_CUDA_HAVE_MXF4)
+    if (!g_device_is_sm120 || g_n_gpus != 1 || g_decode_graph_capturing || source_rows < 32768u ||
+        getenv("DS4_CUDA_NO_V41_FP4_MMA") || getenv("DS4_CUDA_NO_V41_COMPACT_INDEX")) return 0;
+    if (source_rows > INT32_MAX || !dsv41_has_floats(selected, 512u) ||
+        !dsv41_has_floats(scores, 16384u) || !dsv41_has_floats(scratch, 2049u) ||
+        !dsv41_has_floats(blocks, 2048u) || !dsv41_has_floats(q, 4096u) ||
+        !dsv41_has_floats(weights, 32u) || !keys || !keys->ptr ||
+        keys->bytes < (uint64_t)source_rows * 68u) return -1;
+    uint32_t *ordered = (uint32_t *)scratch->ptr, *unsafe = ordered + 2048u;
+    if (!cuda_ok(cudaMemsetAsync(unsafe, 0, sizeof(*unsafe), cuda_decode_stream()),
+                 "V4.1 candidate status reset")) return -1;
+    dsv41_candidate_order_kernel<<<1, 256, 0, cuda_decode_stream()>>>(
+        ordered, unsafe, (const uint32_t *)blocks->ptr, (source_rows + 7u) / 8u);
+    if (!cuda_ok(cudaGetLastError(), "V4.1 candidate order")) return -1;
+    ds4_gpu_tensor packed = *q;
+    packed.bytes = 32u * 68u;
+    packed.ptr = cuda_tmp_alloc_on(ds4_tensor_device_idx(q), packed.bytes, "V4.1 candidate queries");
+    if (!packed.ptr || !ds4_gpu_dsv41_cache_quantize_fp4(&packed, 0, q, 128u, 32u)) return -1;
+    dsv41_index_fp4_mma_kernel<true><<<256, 128, 0, cuda_decode_stream()>>>(
+        (float *)scores->ptr, (const uint8_t *)keys->ptr, (const uint8_t *)packed.ptr,
+        (const float *)q->ptr, (const float *)weights->ptr, 16384u, source_rows - 1u, 1u, ordered);
+    if (!cuda_ok(cudaGetLastError(), "V4.1 candidate FP4 scores")) return -1;
+    dsv41_candidate_scores_check_kernel<<<64, 256, 0, cuda_decode_stream()>>>(
+        unsafe, (const float *)scores->ptr, ordered, source_rows);
+    if (!cuda_ok(cudaGetLastError(), "V4.1 candidate score check")) return -1;
+    uint32_t exceptional = 0;
+    if (!ds4_gpu_tensor_read(scratch, 2048u * sizeof(uint32_t), &exceptional, sizeof(exceptional))) return -1;
+    if (exceptional) return 0;
+    /* Ascending original positions preserve the full tree's stable tie order. */
+    if (!ds4_gpu_indexer_topk_tensor(selected, scores, 16384u, 1u, 512u)) return -1;
+    dsv41_candidate_remap_kernel<<<2, 256, 0, cuda_decode_stream()>>>(
+        (uint32_t *)selected->ptr, ordered);
+    return cuda_ok(cudaGetLastError(), "V4.1 candidate index remap") ? 1 : -1;
+#else
+    (void)selected; (void)scores; (void)scratch; (void)q;
+    (void)weights; (void)keys; (void)blocks; (void)source_rows;
+    return 0;
+#endif
 }
 
 extern "C" int ds4_gpu_dsv41_tensor_ops_available(void) { return 0; }

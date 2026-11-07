@@ -7,6 +7,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef DS4_IMAGE_HAVE_WEBP
+#include <webp/decode.h>
+#endif
+
 #define JPEG_IMPLEMENTATION
 #define PNG_IMPLEMENTATION
 #include "third_party/iris/jpeg.h"
@@ -275,7 +279,45 @@ int ds4_image_decode_memory(
         return ok;
     }
 
-    ds4_image_error(error, error_cap, "image must be JPEG or PNG");
+    if (encoded_len >= 12 && !memcmp(encoded, "RIFF", 4) &&
+        !memcmp(encoded + 8, "WEBP", 4)) {
+#ifdef DS4_IMAGE_HAVE_WEBP
+        WebPBitstreamFeatures features;
+        if (WebPGetFeatures(encoded, encoded_len, &features) != VP8_STATUS_OK) {
+            ds4_image_error(error, error_cap, "invalid or truncated WebP image");
+            return 0;
+        }
+        if (features.has_animation) {
+            ds4_image_error(error, error_cap, "animated WebP images are not supported");
+            return 0;
+        }
+        /* Inspect dimensions before the codec allocates its decoded pixels. */
+        if (features.width <= 0 || features.height <= 0 ||
+            (uint32_t)features.width > DS4_IMAGE_MAX_DIMENSION ||
+            (uint32_t)features.height > DS4_IMAGE_MAX_DIMENSION ||
+            (uint64_t)features.width * features.height > DS4_IMAGE_MAX_PIXELS) {
+            ds4_image_error(error, error_cap, "WebP image exceeds the decoded image limits");
+            return 0;
+        }
+        int width = 0, height = 0;
+        uint8_t *rgb = WebPDecodeRGB(encoded, encoded_len, &width, &height);
+        if (!rgb) {
+            ds4_image_error(error, error_cap, "invalid or unsupported WebP image");
+            return 0;
+        }
+        /* Drop alpha as in the PNG path, then use the same RGB fingerprint. */
+        int ok = ds4_oriented_rgb(out, rgb, (uint32_t)width,
+                                  (uint32_t)height, 3, 1);
+        WebPFree(rgb);
+        if (!ok) ds4_image_error(error, error_cap, "unable to allocate decoded WebP pixels");
+        return ok;
+#else
+        ds4_image_error(error, error_cap, "WebP support requires rebuilding with libwebp installed");
+        return 0;
+#endif
+    }
+
+    ds4_image_error(error, error_cap, "image must be JPEG, PNG or WebP");
     return 0;
 }
 

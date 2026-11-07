@@ -1,4 +1,5 @@
 #include "ds4.h"
+#include "ds4_image.h"
 #include "ds4_tool_text.h"
 #include "ds4_distributed.h"
 #include "ds4_gpu_args.h"
@@ -35,12 +36,14 @@
 #include <string.h>
 #include <strings.h>
 #include <sys/socket.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
 
+static const char *server_api_key;
 static volatile sig_atomic_t g_stop_requested = 0;
 static volatile sig_atomic_t g_listen_fd = -1;
 
@@ -435,6 +438,176 @@ static char *json_minify_raw_value(const char *json) {
     return buf_take(&b);
 }
 
+/* Uploaded originals have their own persistent LRU, independent of embedding/KV LRU.
+ * A single versioned record is atomically published, so an acknowledged ID
+ * survives restart without a separate metadata/database transaction. */
+#define SERVER_FILE_MAX_BYTES (48u * 1024u * 1024u)
+#define SERVER_FILES_QUOTA (64ull * 1024 * 1024 * 1024)
+#define SERVER_FILES_EVICT_BATCH (8ull * 1024 * 1024 * 1024)
+static char *server_files_dir;
+static pthread_mutex_t server_files_mu = PTHREAD_MUTEX_INITIALIZER;
+static __thread char server_file_error[160];
+static __thread char server_missing_file_id[38];
+typedef struct {
+    char magic[8];
+    uint64_t bytes, created_at;
+    char filename[256], purpose[32], mime[32];
+} server_file_record;
+
+static bool server_file_id_valid(const char *id) {
+    if (!id || strlen(id) != 37 || strncmp(id, "file-", 5)) return false;
+    for (size_t i = 5; i < 37; i++)
+        if (!((id[i] >= '0' && id[i] <= '9') || (id[i] >= 'a' && id[i] <= 'f')))
+            return false;
+    return true;
+}
+
+static char *server_file_path(const char *id) {
+    if (!server_files_dir || !server_file_id_valid(id)) return NULL;
+    buf p = {0}; buf_printf(&p, "%s/%s", server_files_dir, id);
+    return buf_take(&p);
+}
+
+static bool server_files_open(const char *dir) {
+    if (mkdir(dir, 0700) && errno != EEXIST) return false;
+    struct stat st;
+    if (lstat(dir, &st) || !S_ISDIR(st.st_mode)) return false;
+    free(server_files_dir); server_files_dir = xstrdup(dir);
+    return true;
+}
+
+static bool server_file_read(const char *id, server_file_record *record, uint8_t **data) {
+    char *path = server_file_path(id);
+    if (!path) return false;
+    int fd = open(path, O_RDONLY | O_NOFOLLOW); free(path);
+    if (fd < 0) return false;
+    FILE *f = fdopen(fd, "rb");
+    if (!f) { close(fd); return false; }
+    struct stat st;
+    bool ok = !fstat(fd, &st) && S_ISREG(st.st_mode) &&
+        fread(record, sizeof(*record), 1, f) == 1 &&
+        !memcmp(record->magic, "DS4FIL1", 8) && record->bytes &&
+        record->bytes <= SERVER_FILE_MAX_BYTES &&
+        st.st_size == (off_t)(sizeof(*record) + record->bytes) &&
+        memchr(record->filename, 0, sizeof(record->filename)) &&
+        memchr(record->purpose, 0, sizeof(record->purpose)) &&
+        memchr(record->mime, 0, sizeof(record->mime));
+    if (ok && data) {
+        *data = xmalloc((size_t)record->bytes);
+        ok = fread(*data, 1, (size_t)record->bytes, f) == record->bytes;
+        if (!ok) { free(*data); *data = NULL; }
+        else futimens(fd, NULL); /* A successful image use refreshes persistent LRU. */
+    }
+    fclose(f);
+    return ok;
+}
+
+static const char *server_file_mime(const uint8_t *data, size_t n) {
+    if (n >= 8 && !memcmp(data, "\x89PNG\r\n\x1a\n", 8)) return "image/png";
+    if (n >= 3 && !memcmp(data, "\xff\xd8\xff", 3)) return "image/jpeg";
+    if (n >= 12 && !memcmp(data, "RIFF", 4) && !memcmp(data + 8, "WEBP", 4)) return "image/webp";
+    return NULL;
+}
+
+static void json_escape(buf *b, const char *s);
+
+static void server_file_json(buf *out, const char *id, const server_file_record *r) {
+    buf_puts(out, "{\"object\":\"file\",\"id\":"); json_escape(out, id);
+    buf_printf(out, ",\"bytes\":%llu,\"created_at\":%llu,\"filename\":",
+        (unsigned long long)r->bytes, (unsigned long long)r->created_at);
+    json_escape(out, r->filename); buf_puts(out, ",\"purpose\":");
+    json_escape(out, r->purpose); buf_puts(out, ",\"mime_type\":");
+    json_escape(out, r->mime); buf_puts(out, ",\"status\":\"processed\",\"status_details\":null}");
+}
+
+typedef struct { char id[38]; uint64_t bytes; struct timespec used; } server_file_age;
+static int server_file_age_compare(const void *a, const void *b) {
+    const server_file_age *x = a, *y = b;
+    if (x->used.tv_sec != y->used.tv_sec) return x->used.tv_sec < y->used.tv_sec ? -1 : 1;
+    if (x->used.tv_nsec != y->used.tv_nsec) return x->used.tv_nsec < y->used.tv_nsec ? -1 : 1;
+    return strcmp(x->id, y->id);
+}
+
+/* The upload mutex serializes quota decisions. mtime is persistent LRU state;
+ * metadata/list operations don't refresh it, while image reads do. */
+static bool server_files_make_room(uint64_t incoming, uint64_t quota, uint64_t batch) {
+    if (incoming > quota) return false;
+    DIR *dir = opendir(server_files_dir);
+    if (!dir) return false;
+    uint64_t used = 0; size_t count = 0;
+    server_file_age *items = NULL;
+    struct dirent *e;
+    while ((e = readdir(dir))) {
+        server_file_record rec;
+        if (!server_file_read(e->d_name, &rec, NULL)) continue;
+        char *path = server_file_path(e->d_name); struct stat st;
+        bool ok = path && !lstat(path, &st) && S_ISREG(st.st_mode); free(path);
+        if (!ok) continue;
+        items = xrealloc(items, (count+1) * sizeof(*items));
+        strcpy(items[count].id, e->d_name); items[count].bytes = rec.bytes;
+#if defined(__APPLE__)
+        items[count].used = st.st_mtimespec;
+#else
+        items[count].used = st.st_mtim;
+#endif
+        count++; used += rec.bytes;
+    }
+    closedir(dir);
+    if (used <= quota - incoming) { free(items); return true; }
+    uint64_t needed = used - (quota - incoming);
+    uint64_t target = batch > needed ? batch : needed;
+    if (count) qsort(items, count, sizeof(*items), server_file_age_compare);
+    uint64_t removed = 0; size_t deleted = 0;
+    for (size_t i = 0; i < count && removed < target; i++) {
+        char *path = server_file_path(items[i].id);
+        if (path && !unlink(path)) { removed += items[i].bytes; deleted++; }
+        free(path);
+    }
+    free(items);
+    if (deleted) {
+        int fd = open(server_files_dir, O_RDONLY | O_DIRECTORY);
+        if (fd >= 0) { fsync(fd); close(fd); }
+        fprintf(stderr, "ds4-server: image files LRU evicted files=%zu bytes=%llu target=%llu\n",
+                deleted, (unsigned long long)removed, (unsigned long long)target);
+    }
+    return used - removed <= quota - incoming;
+}
+
+/* Caller serializes publish/delete/quota checks; readers open immutable records. */
+static bool server_file_store(const uint8_t *data, size_t n,
+                               server_file_record *record, char id[38]) {
+    if (!server_files_make_room(n, SERVER_FILES_QUOTA, SERVER_FILES_EVICT_BATCH)) {
+        snprintf(server_file_error, sizeof(server_file_error), "cannot reclaim image file storage");
+        return false;
+    }
+    unsigned char nonce[16];
+    if (!random_bytes(nonce, sizeof(nonce))) return false;
+    memcpy(id, "file-", 5);
+    for (size_t i = 0; i < sizeof(nonce); i++) snprintf(id + 5 + 2*i, 3, "%02x", nonce[i]);
+    char *path = server_file_path(id);
+    buf tmp = {0}; buf_printf(&tmp, "%s/.upload-XXXXXX", server_files_dir);
+    int fd = mkstemp(tmp.ptr);
+    bool ok = false;
+    if (fd >= 0) {
+        FILE *f = fdopen(fd, "wb");
+        if (f) {
+            ok = fwrite(record, sizeof(*record), 1, f) == 1 &&
+                 fwrite(data, 1, n, f) == n && !fflush(f) && !fsync(fd);
+            if (fclose(f)) ok = false;
+        } else close(fd);
+        /* link avoids replacing an existing ID even in the unlikely collision. */
+        if (ok) ok = !link(tmp.ptr, path);
+        unlink(tmp.ptr);
+        if (ok) {
+            int dfd = open(server_files_dir, O_RDONLY | O_DIRECTORY);
+            ok = dfd >= 0 && !fsync(dfd);
+            if (dfd >= 0) close(dfd);
+            if (!ok) unlink(path);
+        }
+    }
+    free(path); buf_free(&tmp); return ok;
+}
+
 #define SERVER_IMAGE_MARKER_BYTES 64
 
 typedef struct {
@@ -498,18 +671,15 @@ static bool server_decode_base64(const char *src, uint8_t **out, size_t *out_len
 static bool server_image_media_type(const char *media_type) {
     return media_type &&
            (!strcasecmp(media_type, "image/png") ||
+            !strcasecmp(media_type, "image/webp") ||
             !strcasecmp(media_type, "image/jpeg") ||
             !strcasecmp(media_type, "image/jpg"));
 }
 
-static bool server_image_inputs_push_base64(server_image_inputs *images,
-                                            const char *media_type,
-                                            const char *base64,
-                                            char marker[SERVER_IMAGE_MARKER_BYTES]) {
-    if (!server_image_media_type(media_type)) return false;
-    server_image_input image = {0};
-    if (!server_decode_base64(base64, &image.encoded, &image.encoded_len))
-        return false;
+static bool server_image_inputs_push_encoded(server_image_inputs *images,
+                                             uint8_t *encoded, size_t encoded_len,
+                                             char marker[SERVER_IMAGE_MARKER_BYTES]) {
+    server_image_input image = {.encoded = encoded, .encoded_len = encoded_len};
     unsigned char nonce[12];
     if (!random_bytes(nonce, sizeof(nonce))) {
         uint64_t fallback = (uint64_t)time(NULL) ^
@@ -537,13 +707,39 @@ static bool server_image_inputs_push_base64(server_image_inputs *images,
     return true;
 }
 
+static bool server_image_inputs_push_base64(server_image_inputs *images,
+                                            const char *media_type, const char *base64,
+                                            char marker[SERVER_IMAGE_MARKER_BYTES]) {
+    uint8_t *encoded = NULL; size_t len = 0;
+    if (!server_image_media_type(media_type) ||
+        !server_decode_base64(base64, &encoded, &len)) return false;
+    return server_image_inputs_push_encoded(images, encoded, len, marker);
+}
+
+static bool server_image_inputs_push_file(server_image_inputs *images, const char *id,
+                                          char marker[SERVER_IMAGE_MARKER_BYTES]) {
+    server_file_record r; uint8_t *encoded = NULL;
+    if (!server_file_read(id, &r, &encoded)) {
+        if (server_file_id_valid(id)) {
+            snprintf(server_missing_file_id, sizeof(server_missing_file_id), "%s", id);
+            snprintf(server_file_error, sizeof(server_file_error), "file %s not found", id);
+        } else {
+            snprintf(server_file_error, sizeof(server_file_error), "invalid image file_id");
+        }
+        return false;
+    }
+    return server_image_inputs_push_encoded(images, encoded, (size_t)r.bytes, marker);
+}
+
 static bool server_image_inputs_push_data_uri(
         server_image_inputs *images, const char *uri,
         char marker[SERVER_IMAGE_MARKER_BYTES]) {
     static const char png[] = "data:image/png;base64,";
     static const char jpeg[] = "data:image/jpeg;base64,";
     static const char jpg[] = "data:image/jpg;base64,";
+    static const char webp[] = "data:image/webp;base64,";
     if (!uri) return false;
+    if (!strncmp(uri, "file-", 5)) return server_image_inputs_push_file(images, uri, marker);
     if (!strncmp(uri, png, sizeof(png) - 1))
         return server_image_inputs_push_base64(
             images, "image/png", uri + sizeof(png) - 1, marker);
@@ -553,6 +749,9 @@ static bool server_image_inputs_push_data_uri(
     if (!strncmp(uri, jpg, sizeof(jpg) - 1))
         return server_image_inputs_push_base64(
             images, "image/jpg", uri + sizeof(jpg) - 1, marker);
+    if (!strncmp(uri, webp, sizeof(webp) - 1))
+        return server_image_inputs_push_base64(
+            images, "image/webp", uri + sizeof(webp) - 1, marker);
     return false;
 }
 
@@ -707,6 +906,7 @@ static void random_tool_id(char *dst, size_t dstlen, api_style api) {
 typedef struct server server;
 static void server_inference_lock(server *s);
 static void server_inference_unlock(server *s);
+static int server_context_size(const server *s);
 static bool server_encode_image(server *s, const server_image_input *input,
                                 ds4_vision_embedding *out,
                                 char *err, size_t errlen);
@@ -1036,25 +1236,24 @@ static ds4_think_mode think_mode_from_enabled(bool enabled, ds4_think_mode effor
 
 static bool parse_reasoning_effort_name(const char *s, ds4_think_mode *out) {
     if (!s) return false;
-    if (!strcmp(s, "max")) {
+    if (!strcasecmp(s, "max")) {
         *out = DS4_THINK_MAX;
         return true;
     }
-    if (!strcmp(s, "xhigh") || !strcmp(s, "high")) {
+    if (!strcasecmp(s, "xhigh") || !strcasecmp(s, "high")) {
         *out = DS4_THINK_HIGH;
         return true;
     }
-    if (!strcmp(s, "medium")) {
+    if (!strcasecmp(s, "medium")) {
         *out = DS4_THINK_MEDIUM;
         return true;
     }
-    if (!strcmp(s, "low") || !strcmp(s, "minimal")) {
-        /* "minimal" is the smallest non-zero level; callers that need *no*
-         * reasoning must use "none" instead. */
+    if (!strcasecmp(s, "low") || !strcasecmp(s, "minimal")) {
+        /* "minimal" aliases the low preset; it does not disable reasoning. */
         *out = DS4_THINK_LOW;
         return true;
     }
-    if (!strcmp(s, "none")) {
+    if (!strcasecmp(s, "none") || !strcasecmp(s, "off")) {
         *out = DS4_THINK_NONE;
         return true;
     }
@@ -1094,8 +1293,8 @@ static bool parse_thinking_control_value(const char **p, bool *thinking_enabled)
                 free(key);
                 return false;
             }
-            if (!strcmp(type, "enabled")) *thinking_enabled = true;
-            else if (!strcmp(type, "disabled")) *thinking_enabled = false;
+            if (!strcasecmp(type, "enabled")) *thinking_enabled = true;
+            else if (!strcasecmp(type, "disabled")) *thinking_enabled = false;
             free(type);
         } else if (!json_skip_value(p)) {
             free(key);
@@ -1956,9 +2155,11 @@ static bool parse_image_url_value(const char **p, char **url) {
         }
         (*p)++;
         bool ok = true;
-        if (!strcmp(key, "url")) {
+        if (!strcmp(key, "url") || !strcmp(key, "file_id")) {
             char *next = NULL;
-            ok = json_string(p, &next);
+            ok = !*url && json_string(p, &next);
+            if (ok && !strcmp(key, "file_id")) ok = server_file_id_valid(next);
+            if (!ok) free(next);
             if (ok) {
                 free(*url);
                 *url = next;
@@ -1998,9 +2199,11 @@ static bool parse_openai_content_object(const char **p, chat_msg *msg) {
             ok = json_string_replace(p, &type);
         else if (!strcmp(key, "text"))
             ok = json_content_replace(p, &text);
-        else if (!strcmp(key, "image_url")) {
-            free(image_url);
-            image_url = NULL;
+        else if (!strcmp(key, "file_id")) {
+            if (image_url) { free(key); goto bad; }
+            ok = json_string_replace(p, &image_url) && server_file_id_valid(image_url);
+        } else if (!strcmp(key, "image_url") || !strcmp(key, "file") || !strcmp(key, "image_file")) {
+            if (image_url) { free(key); goto bad; }
             ok = parse_image_url_value(p, &image_url);
         } else
             ok = json_skip_value(p);
@@ -2013,7 +2216,8 @@ static bool parse_openai_content_object(const char **p, chat_msg *msg) {
     if (**p != '}') goto bad;
     (*p)++;
 
-    if (type && (!strcmp(type, "image_url") || !strcmp(type, "input_image"))) {
+    if (type && (!strcmp(type, "image_url") || !strcmp(type, "input_image") ||
+                 !strcmp(type, "file") || !strcmp(type, "image_file"))) {
         char marker[SERVER_IMAGE_MARKER_BYTES];
         if (!server_image_inputs_push_data_uri(&msg->images, image_url, marker))
             goto bad;
@@ -2065,6 +2269,15 @@ static bool parse_openai_content(const char **p, chat_msg *msg) {
     return true;
 }
 
+/* Some clients replay absent reasoning as a space. Rendering that padding
+ * would change the cached prompt prefix and needlessly replay long histories. */
+static bool text_is_blank(const char *s) {
+    if (!s) return true;
+    for (; *s; s++)
+        if (!isspace((unsigned char)*s)) return false;
+    return true;
+}
+
 static bool parse_messages(const char **p, chat_msgs *msgs) {
     json_ws(p);
     if (**p != '[') return false;
@@ -2102,6 +2315,10 @@ static bool parse_messages(const char **p, chat_msgs *msgs) {
                 if (!json_content_replace(p, &msg.reasoning)) {
                     free(key);
                     goto fail;
+                }
+                if (text_is_blank(msg.reasoning)) {
+                    free(msg.reasoning);
+                    msg.reasoning = NULL;
                 }
             } else if (!strcmp(key, "tool_call_id")) {
                 char *id = NULL;
@@ -2176,8 +2393,10 @@ static bool parse_anthropic_image_source(const char **p,
             ok = json_string_replace(p, source_type);
         else if (!strcmp(key, "media_type"))
             ok = json_string_replace(p, media_type);
-        else if (!strcmp(key, "data"))
+        else if (!strcmp(key, "data") || !strcmp(key, "file_id")) {
+            if (*data) { free(key); return false; }
             ok = json_string_replace(p, data);
+        }
         else
             ok = json_skip_value(p);
         free(key);
@@ -2322,9 +2541,11 @@ static bool parse_anthropic_content_block(const char **p, bool allow_tools, chat
         chat_msg_free(&nested);
     } else if (type && !strcmp(type, "image")) {
         char marker[SERVER_IMAGE_MARKER_BYTES];
-        if (!source_type || strcmp(source_type, "base64") ||
-            !server_image_inputs_push_base64(&msg->images, media_type,
-                                             image_data, marker))
+        if (!source_type || !(
+            (!strcmp(source_type, "file") &&
+             server_image_inputs_push_file(&msg->images, image_data, marker)) ||
+            (!strcmp(source_type, "base64") &&
+             server_image_inputs_push_base64(&msg->images, media_type, image_data, marker))))
             goto bad;
         append_owned_text(&msg->content, marker);
     } else {
@@ -3651,18 +3872,19 @@ static bool request_tokenize_multimodal_prompt(ds4_engine *e, server *s,
         ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
         return true;
     }
-    if (count > 16) {
-        snprintf(err, errlen, "too many images; at most 16 are allowed");
-        return false;
-    }
     if (!e || !s || !ds4_engine_has_vision(e)) {
         snprintf(err, errlen, "image input requires starting ds4-server with --vision FILE");
         return false;
     }
+    const int context = server_context_size(s);
+    /* Every image consumes at least one context position. The actual limit
+     * below uses the rendered token count, including text and image markers. */
+    if (context <= 0 || count >= (size_t)context) {
+        snprintf(err, errlen, "image count cannot fit context %d", context);
+        return false;
+    }
 
     server_image_input **inputs = xmalloc(count * sizeof(inputs[0]));
-    ds4_vision_embedding *embeddings = xmalloc(count * sizeof(embeddings[0]));
-    memset(embeddings, 0, count * sizeof(embeddings[0]));
     size_t next = 0;
     for (int i = 0; i < msgs->len; i++) {
         for (size_t j = 0; j < msgs->v[i].images.len; j++)
@@ -3670,20 +3892,13 @@ static bool request_tokenize_multimodal_prompt(ds4_engine *e, server *s,
     }
 
     bool ok = true;
-    server_inference_lock(s);
-    for (size_t i = 0; i < count; i++) {
-        if (!server_encode_image(s, inputs[i], &embeddings[i], err, errlen)) {
-            ok = false;
-            break;
-        }
-    }
-    server_inference_unlock(s);
-    if (!ok) goto done;
-
     r->images = xmalloc(count * sizeof(r->images[0]));
     r->image_markers = xmalloc(count * sizeof(r->image_markers[0]));
     memset(r->images, 0, count * sizeof(r->images[0]));
     const char *cursor = r->prompt_text;
+    /* Prepare one image at a time, stopping at the context boundary instead
+     * of encoding a whole oversized history before discovering it cannot fit. */
+    server_inference_lock(s);
     for (size_t i = 0; i < count; i++) {
         const char *marker = strstr(cursor, inputs[i]->marker);
         if (!marker) {
@@ -3694,21 +3909,30 @@ static bool request_tokenize_multimodal_prompt(ds4_engine *e, server *s,
         char *prefix = xstrndup(cursor, (size_t)(marker - cursor));
         ds4_tokenize_rendered_chat(e, prefix, &r->prompt);
         free(prefix);
+        if (r->prompt.len >= context) { ok = false; break; }
+        ds4_vision_embedding embedding = {0};
+        if (!server_encode_image(s, inputs[i], &embedding, err, errlen)) {
+            ok = false;
+            break;
+        }
         if (!ds4_prompt_append_vision(e, &r->prompt, &r->images[i],
-                                      &embeddings[i], err, errlen)) {
+                                      &embedding, err, errlen)) {
+            ds4_vision_embedding_free(&embedding);
             ok = false;
             break;
         }
         r->image_count++;
         memcpy(r->image_markers[i], inputs[i]->marker, sizeof(r->image_markers[i]));
         cursor = marker + strlen(inputs[i]->marker);
+        if (r->prompt.len >= context) { ok = false; break; }
     }
+    server_inference_unlock(s);
     if (ok) ds4_tokenize_rendered_chat(e, cursor, &r->prompt);
-
-done:
-    for (size_t i = 0; i < count; i++)
-        ds4_vision_embedding_free(&embeddings[i]);
-    free(embeddings);
+    if (r->prompt.len >= context) {
+        snprintf(err, errlen, "multimodal prompt length %d exceeds context %d (output needs at least one token)",
+                 r->prompt.len, context);
+        ok = false;
+    }
     free(inputs);
     if (!ok) {
         ds4_tokens_free(&r->prompt);
@@ -4594,10 +4818,11 @@ static bool parse_responses_content_array(const char **p, char **out,
                         free(image_url);
                         goto fail;
                     }
-                } else if (!strcmp(key, "image_url")) {
-                    free(image_url);
-                    image_url = NULL;
-                    if (!parse_image_url_value(p, &image_url)) {
+                } else if (!strcmp(key, "image_url") || !strcmp(key, "file_id")) {
+                    bool is_file = !strcmp(key, "file_id");
+                    if (image_url || !(is_file ? (json_string(p, &image_url) && server_file_id_valid(image_url)) :
+                                      parse_image_url_value(p, &image_url))) {
+                        free(image_url);
                         free(key);
                         free(type);
                         free(text);
@@ -6899,7 +7124,7 @@ static void append_tool_call_deltas_json(buf *b, const tool_calls *calls, const 
 static void append_cors_headers(buf *h) {
     buf_puts(h,
         "Access-Control-Allow-Origin: *\r\n"
-        "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+        "Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\n"
         "Access-Control-Allow-Headers: *\r\n");
 }
 
@@ -6907,6 +7132,7 @@ static bool http_response(int fd, bool enable_cors, int code, const char *type, 
     const char *reason = code == 200 ? "OK" :
                          code == 204 ? "No Content" :
                          code == 400 ? "Bad Request" :
+                         code == 401 ? "Unauthorized" :
                          code == 404 ? "Not Found" :
                          code == 409 ? "Conflict" :
                          code == 500 ? "Internal Server Error" : "Error";
@@ -6916,6 +7142,7 @@ static bool http_response(int fd, bool enable_cors, int code, const char *type, 
         "HTTP/1.1 %d %s\r\n"
         "Content-Length: %zu\r\n",
         code, reason, body_len);
+    if (code == 401) buf_puts(&h, "WWW-Authenticate: Bearer\r\n");
     if (type && type[0]) {
         buf_puts(&h, "Content-Type: ");
         buf_puts(&h, type);
@@ -6937,6 +7164,18 @@ static bool http_error(int fd, bool enable_cors, int code, const char *msg) {
     bool ok = http_response(fd, enable_cors, code, "application/json", b.ptr);
     buf_free(&b);
     return ok;
+}
+
+static bool http_error_file_not_found(int fd, bool cors, const char *id) {
+    buf out = {0}, message = {0};
+    buf_printf(&message, "file %s not found", id);
+    buf_puts(&out, "{\"error\":{\"type\":\"invalid_request_error\","
+                   "\"code\":\"file_not_found\",\"param\":");
+    json_escape(&out, id);
+    buf_puts(&out, ",\"message\":"); json_escape(&out, message.ptr);
+    buf_puts(&out, "}}\n");
+    bool ok = http_response(fd, cors, 400, "application/json", out.ptr);
+    buf_free(&out); buf_free(&message); return ok;
 }
 
 static const char *context_length_error_param(const request *r) {
@@ -7191,7 +7430,8 @@ typedef struct {
 
 static bool stream_needs_second_reasoning_guard(const request *r) {
     return ds4_think_mode_enabled(r->think_mode) && r->has_tools &&
-           r->model_syntax != SERVER_MODEL_SYNTAX_QWEN;
+           r->model_syntax != SERVER_MODEL_SYNTAX_QWEN &&
+           r->model_syntax != SERVER_MODEL_SYNTAX_DEEPSEEK41;
 }
 
 static void openai_stream_start(const request *r, openai_stream *st) {
@@ -9939,14 +10179,21 @@ typedef struct {
  * before any prefix is reused. Normalization preserves all byte offsets. */
 typedef struct {
     size_t count;
-    size_t offsets[16];
+    size_t *offsets;
 } visible_image_key;
+
+static void visible_image_key_free(visible_image_key *images) {
+    free(images->offsets);
+    memset(images, 0, sizeof(*images));
+}
 
 static char *visible_prompt_key(const request *req, const char *text,
                                  visible_image_key *images) {
     memset(images, 0, sizeof(*images));
-    if (!req || !text || req->image_count > 16 ||
+    if (!req || !text || req->image_count > SIZE_MAX / sizeof(*images->offsets) ||
         (req->image_count && !req->image_markers)) return NULL;
+    if (req->image_count)
+        images->offsets = xmalloc(req->image_count * sizeof(*images->offsets));
     char *key = xstrdup(text);
     const char *cursor = text;
     for (size_t i = 0; i < req->image_count; i++) {
@@ -9954,12 +10201,34 @@ static char *visible_prompt_key(const request *req, const char *text,
         size_t len = strlen(req->image_markers[i]);
         if (!marker || !len) {
             free(key);
+            visible_image_key_free(images);
             return NULL;
         }
         images->offsets[images->count++] = (size_t)(marker - text);
         memset(key + (marker - text), '\036', len);
         cursor = marker + len;
     }
+    return key;
+}
+
+/* Stable disk lookup bytes preserve raw-text offsets. The full 256-bit
+ * fingerprint and token positions in the snapshot are checked again on load;
+ * the 128-bit marker digest is only an index, never proof of image identity. */
+static char *vision_disk_prompt_key(const request *req) {
+    visible_image_key images;
+    char *key = visible_prompt_key(req, req->prompt_text, &images);
+    if (!key) return NULL;
+    static const char hex[] = "0123456789abcdef";
+    for (size_t i = 0; i < images.count; i++) {
+        if (strlen(req->image_markers[i]) < 32u) {
+            free(key); visible_image_key_free(&images); return NULL;
+        }
+        for (size_t j = 0; j < 16; j++) {
+            key[images.offsets[i] + j * 2] = hex[req->images[i].embedding.fingerprint[j] >> 4];
+            key[images.offsets[i] + j * 2 + 1] = hex[req->images[i].embedding.fingerprint[j] & 15];
+        }
+    }
+    visible_image_key_free(&images);
     return key;
 }
 
@@ -10040,8 +10309,12 @@ struct server_slot {
     char decode_err[160];
 };
 
-#define SERVER_IMAGE_CACHE_ENTRIES 32
-#define SERVER_IMAGE_CACHE_BYTES (128u * 1024u * 1024u)
+#define SERVER_IMAGE_CACHE_ENTRIES 8192
+/* Host memory only, allocated on demand. A full multi-image history must fit
+ * or sequential replay turns an LRU cache into a miss on every image. */
+#define SERVER_IMAGE_CACHE_BYTES (24ull * 1024ull * 1024ull * 1024ull)
+#define SERVER_IMAGE_ENTRY_BYTES (1024u * 1024u * 1024u)
+#define SERVER_IMAGE_DISK_BYTES (64ull * 1024ull * 1024ull * 1024ull)
 
 typedef struct {
     uint8_t *encoded;
@@ -10052,9 +10325,12 @@ typedef struct {
 } server_image_cache_entry;
 
 typedef struct {
-    server_image_cache_entry entries[SERVER_IMAGE_CACHE_ENTRIES];
+    server_image_cache_entry *entries;
     size_t bytes;
     uint64_t clock;
+    char *disk_dir;
+    char model_key[41];
+    uint64_t disk_budget;
 } server_image_cache;
 
 static void server_image_cache_remove(server_image_cache *cache,
@@ -10066,14 +10342,17 @@ static void server_image_cache_remove(server_image_cache *cache,
 }
 
 static void server_image_cache_clear(server_image_cache *cache) {
-    for (size_t i = 0; i < SERVER_IMAGE_CACHE_ENTRIES; i++)
+    for (size_t i = 0; cache->entries && i < SERVER_IMAGE_CACHE_ENTRIES; i++)
         server_image_cache_remove(cache, &cache->entries[i]);
+    free(cache->entries);
+    cache->entries = NULL;
     cache->clock = 0;
 }
 
 static bool server_image_cache_get(server_image_cache *cache,
                                    const server_image_input *input,
                                    ds4_vision_embedding *out) {
+    if (!cache->entries) return false;
     for (size_t i = 0; i < SERVER_IMAGE_CACHE_ENTRIES; i++) {
         server_image_cache_entry *entry = &cache->entries[i];
         if (!entry->encoded || entry->encoded_len != input->encoded_len ||
@@ -10101,6 +10380,10 @@ static void server_image_cache_put(server_image_cache *cache,
     size_t bytes = (size_t)embedding->token_count * dim * sizeof(float);
     if (input->encoded_len > budget - bytes) return;
     size_t total = input->encoded_len + bytes;
+    if (!cache->entries) {
+        cache->entries = calloc(SERVER_IMAGE_CACHE_ENTRIES, sizeof(*cache->entries));
+        if (!cache->entries) return;
+    }
     server_image_cache_entry *dest;
     for (;;) {
         dest = &cache->entries[0];
@@ -10133,6 +10416,254 @@ static void server_image_cache_put(server_image_cache *cache,
     };
     dest->embedding.data = data;
     cache->bytes += total;
+}
+
+/* A local, lossless cache of the natural encoder output, before prompt layout
+ * expansion. The filename is only an index: load verifies the original image
+ * bytes, model namespace, dimensions and a checksum over metadata + payload.
+ * Native floats are intentional; the byte-order tag rejects foreign files. */
+typedef struct {
+    char magic[8];
+    uint32_t endian;
+    uint32_t dim;
+    uint64_t encoded_bytes;
+    uint32_t meta[8];
+    uint8_t fingerprint[32];
+    char model_key[40];
+} server_image_disk_header;
+
+static char *server_image_disk_path(const server_image_cache *cache,
+                                    const server_image_input *input) {
+    if (!cache->disk_dir) return NULL;
+    char key[41], name[86];
+    ds4_kvstore_sha1_bytes_hex(input->encoded, input->encoded_len, key);
+    snprintf(name, sizeof(name), "%.40s-%.40s.emb", cache->model_key, key);
+    return ds4_kvstore_path_join(cache->disk_dir, name);
+}
+
+static bool server_image_disk_name(const char *name) {
+    if (strlen(name) != 85 || name[40] != '-' || strcmp(name + 81, ".emb"))
+        return false;
+    for (size_t i = 0; i < 81; i++)
+        if (i != 40 && !isxdigit((unsigned char)name[i])) return false;
+    return true;
+}
+
+typedef struct {
+    char *path;
+    uint64_t bytes;
+    struct timespec used;
+} server_image_disk_entry;
+
+static int server_image_disk_lru_cmp(const void *a, const void *b) {
+    const server_image_disk_entry *x = a, *y = b;
+    if (x->used.tv_sec != y->used.tv_sec)
+        return x->used.tv_sec < y->used.tv_sec ? -1 : 1;
+    return (x->used.tv_nsec > y->used.tv_nsec) -
+           (x->used.tv_nsec < y->used.tv_nsec);
+}
+
+/* All model namespaces share this budget. mtime is touched on RAM and disk
+ * hits, so a hot RAM entry is not the oldest file when disk eviction runs. */
+static bool server_image_disk_trim(server_image_cache *cache, uint64_t extra) {
+    if (!cache->disk_dir || extra > cache->disk_budget) return false;
+    DIR *dir = opendir(cache->disk_dir);
+    if (!dir) return false;
+    server_image_disk_entry *entries = NULL;
+    size_t count = 0;
+    uint64_t total = 0;
+    struct dirent *de;
+    while ((de = readdir(dir)) != NULL) {
+        /* A killed writer may leave a temporary file. Ignore active writes,
+         * but reclaim old ones so repeated restarts cannot leak disk space. */
+        if (strlen(de->d_name) == 96 && !strncmp(de->d_name + 85, ".tmp.", 5)) {
+            char base[86];
+            memcpy(base, de->d_name, 85);
+            base[85] = '\0';
+            if (server_image_disk_name(base)) {
+                char *path = ds4_kvstore_path_join(cache->disk_dir, de->d_name);
+                struct stat st;
+                if (lstat(path, &st) == 0 && S_ISREG(st.st_mode) &&
+                    st.st_mtime < time(NULL) - 3600) (void)unlink(path);
+                free(path);
+            }
+            continue;
+        }
+        if (!server_image_disk_name(de->d_name)) continue;
+        char *path = ds4_kvstore_path_join(cache->disk_dir, de->d_name);
+        struct stat st;
+        if (lstat(path, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 0) {
+            free(path);
+            continue;
+        }
+        entries = xrealloc(entries, (count + 1) * sizeof(*entries));
+        entries[count].path = path;
+        entries[count].bytes = (uint64_t)st.st_size;
+#ifdef __APPLE__
+        entries[count].used = st.st_mtimespec;
+#else
+        entries[count].used = st.st_mtim;
+#endif
+        total += entries[count++].bytes;
+    }
+    closedir(dir);
+    if (count > 1) qsort(entries, count, sizeof(*entries), server_image_disk_lru_cmp);
+    for (size_t i = 0; i < count; i++) {
+        if (total > cache->disk_budget - extra && unlink(entries[i].path) == 0)
+            total -= entries[i].bytes;
+        free(entries[i].path);
+    }
+    free(entries);
+    return total <= cache->disk_budget - extra;
+}
+
+static bool server_image_disk_get(server_image_cache *cache, const char *path,
+                                   const server_image_input *input, uint32_t dim,
+                                   ds4_vision_embedding *out) {
+    if (!path || !dim) return false;
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return false;
+    struct stat st;
+    bool ok = fstat(fileno(fp), &st) == 0 && S_ISREG(st.st_mode) &&
+              st.st_size >= (off_t)(sizeof(server_image_disk_header) + 40) &&
+              (uint64_t)st.st_size <= SERVER_IMAGE_ENTRY_BYTES +
+                                      sizeof(server_image_disk_header) + 40;
+    size_t size = ok ? (size_t)st.st_size : 0;
+    uint8_t *blob = ok ? malloc(size) : NULL;
+    if (ok && !blob) { fclose(fp); return false; }
+    if (ok) ok = fread(blob, 1, size, fp) == size;
+    fclose(fp);
+    server_image_disk_header h = {0};
+    size_t bytes = 0;
+    if (ok) {
+        char checksum[41];
+        ds4_kvstore_sha1_bytes_hex(blob, size - 40, checksum);
+        memcpy(&h, blob, sizeof(h));
+        ok = !memcmp(checksum, blob + size - 40, 40) &&
+             !memcmp(h.magic, "DS4IMG1", 8) && h.endian == 0x01020304u &&
+             !memcmp(h.model_key, cache->model_key, 40) && h.dim == dim &&
+             h.encoded_bytes == input->encoded_len && h.meta[0] &&
+             h.meta[0] <= SERVER_IMAGE_ENTRY_BYTES / sizeof(float) / dim;
+        if (ok) {
+            bytes = (size_t)h.meta[0] * dim * sizeof(float);
+            ok = input->encoded_len <= SERVER_IMAGE_ENTRY_BYTES - bytes &&
+                 size == sizeof(h) + input->encoded_len + bytes + 40 &&
+                 !memcmp(blob + sizeof(h), input->encoded, input->encoded_len) &&
+                 h.meta[1] <= 1 && h.meta[4] && h.meta[5] && h.meta[6] && h.meta[7];
+            if (ok && h.meta[1] == 1)
+                ok = (uint64_t)h.meta[2] * h.meta[3] == h.meta[0];
+        }
+    }
+    if (!ok) {
+        free(blob);
+        unlink(path);
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: vision embedding disk cache rejected; recomputing");
+        return false;
+    }
+    float *data = malloc(bytes);
+    if (!data) { free(blob); return false; }
+    memcpy(data, blob + sizeof(h) + input->encoded_len, bytes);
+    free(blob);
+    *out = (ds4_vision_embedding) {
+        .data = data, .token_count = h.meta[0], .layout = h.meta[1],
+        .grid_width = h.meta[2], .grid_height = h.meta[3],
+        .width = h.meta[4], .height = h.meta[5],
+        .content_width = h.meta[6], .content_height = h.meta[7],
+    };
+    memcpy(out->fingerprint, h.fingerprint, sizeof(out->fingerprint));
+    (void)utimensat(AT_FDCWD, path, NULL, 0);
+    return true;
+}
+
+static bool server_image_disk_put(server_image_cache *cache, const char *path,
+                                   const server_image_input *input,
+                                   const ds4_vision_embedding *embedding, uint32_t dim) {
+    if (!path || !embedding->data || !dim || !embedding->token_count ||
+        embedding->token_count > SERVER_IMAGE_ENTRY_BYTES / sizeof(float) / dim)
+        return false;
+    size_t bytes = (size_t)embedding->token_count * dim * sizeof(float);
+    if (input->encoded_len > SERVER_IMAGE_ENTRY_BYTES - bytes) return false;
+    size_t size = sizeof(server_image_disk_header) + input->encoded_len + bytes + 40;
+    uint8_t *blob = malloc(size);
+    if (!blob) return false;
+    server_image_disk_header h;
+    memset(&h, 0, sizeof(h));
+    memcpy(h.magic, "DS4IMG1", 8);
+    h.endian = 0x01020304u;
+    h.dim = dim;
+    h.encoded_bytes = input->encoded_len;
+    const uint32_t meta[8] = {embedding->token_count, embedding->layout,
+        embedding->grid_width, embedding->grid_height, embedding->width,
+        embedding->height, embedding->content_width, embedding->content_height};
+    memcpy(h.meta, meta, sizeof(meta));
+    memcpy(h.fingerprint, embedding->fingerprint, sizeof(h.fingerprint));
+    memcpy(h.model_key, cache->model_key, 40);
+    memcpy(blob, &h, sizeof(h));
+    memcpy(blob + sizeof(h), input->encoded, input->encoded_len);
+    memcpy(blob + sizeof(h) + input->encoded_len, embedding->data, bytes);
+    char checksum[41];
+    ds4_kvstore_sha1_bytes_hex(blob, size - 40, checksum);
+    memcpy(blob + size - 40, checksum, 40);
+    bool ok = server_image_disk_trim(cache, size);
+    char *tmp = xmalloc(strlen(path) + 12);
+    sprintf(tmp, "%s.tmp.XXXXXX", path);
+    int fd = ok ? mkstemp(tmp) : -1;
+    if (fd < 0) ok = false;
+    FILE *fp = fd >= 0 ? fdopen(fd, "wb") : NULL;
+    if (fd >= 0 && !fp) { close(fd); ok = false; }
+    if (fp) {
+        ok = fwrite(blob, 1, size, fp) == size && fflush(fp) == 0 && fsync(fd) == 0;
+        if (fclose(fp) != 0) ok = false;
+    }
+    if (ok) ok = rename(tmp, path) == 0;
+    if (!ok) unlink(tmp);
+    else {
+        int dirfd = open(cache->disk_dir, O_RDONLY | O_DIRECTORY);
+        if (dirfd >= 0) { (void)fsync(dirfd); close(dirfd); }
+    }
+    free(tmp);
+    free(blob);
+    return ok;
+}
+
+static void server_image_disk_open(server_image_cache *cache, const char *kv_dir,
+                                    const char *vision_path, ds4_backend backend,
+                                    int model_id, uint32_t dim) {
+    if (!kv_dir || !vision_path) return;
+    int fd = open(vision_path, O_RDONLY);
+    struct stat st;
+    if (fd < 0) return;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0 ||
+        (uint64_t)st.st_size > SIZE_MAX) { close(fd); return; }
+    void *map = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (map == MAP_FAILED) return;
+    char model_digest[41];
+    ds4_kvstore_sha1_bytes_hex(map, (size_t)st.st_size, model_digest);
+    munmap(map, (size_t)st.st_size);
+    /* Bump the encoder revision when preprocessing or encoder arithmetic changes.
+     * Full sidecar content + backend + model shape keep models/backends apart. */
+    const char *qwen_tokens = getenv("DS4_QWEN4_IMAGE_MAX_TOKENS");
+    buf identity = {0};
+    buf_printf(&identity, "vision-encoder-v1/%s/%d/%d/%u/%s", model_digest,
+               (int)backend, model_id, dim, qwen_tokens ? qwen_tokens : "");
+    ds4_kvstore_sha1_bytes_hex(identity.ptr, identity.len, cache->model_key);
+    buf_free(&identity);
+    char *dir = ds4_kvstore_path_join(kv_dir, "vision-embeddings");
+    bool made = mkdir(dir, 0700) == 0 || errno == EEXIST;
+    if (!made || stat(dir, &st) != 0 || !S_ISDIR(st.st_mode)) {
+        server_log(DS4_LOG_WARNING, "ds4-server: cannot create vision disk cache: %s", strerror(errno));
+        free(dir);
+        return;
+    }
+    cache->disk_dir = dir;
+    cache->disk_budget = SERVER_IMAGE_DISK_BYTES;
+    (void)server_image_disk_trim(cache, 0);
+    server_log(DS4_LOG_KVCACHE,
+               "ds4-server: vision embedding cache RAM=%u MiB disk=%llu MiB dir=%s policy=LRU",
+               (unsigned)(SERVER_IMAGE_CACHE_BYTES / (1024u * 1024u)),
+               (unsigned long long)(cache->disk_budget / (1024u * 1024u)), dir);
 }
 
 static bool id_list_contains(const stop_list *ids, const char *id);
@@ -10185,25 +10716,46 @@ static void server_inference_unlock(server *s) {
     pthread_mutex_unlock(&s->inference_mu);
 }
 
+static int server_context_size(const server *s) {
+    return s ? s->ctx_size : 0;
+}
+
 /* The caller holds inference_mu across cache lookup and encoder execution. */
 static bool server_encode_image(server *s, const server_image_input *input,
                                 ds4_vision_embedding *out,
                                 char *err, size_t errlen) {
+    const double t0 = now_sec();
+    const uint32_t dim = (uint32_t)ds4_engine_embd_dim(s->engine);
+    char *path = server_image_disk_path(&s->image_cache, input);
     if (server_image_cache_get(&s->image_cache, input, out)) {
-        server_log(DS4_LOG_KVCACHE, "ds4-server: vision embedding cache hit");
+        if (path) (void)utimensat(AT_FDCWD, path, NULL, 0);
+        free(path);
+        server_log(DS4_LOG_KVCACHE, "ds4-server: vision embedding cache hit source=RAM %.1f ms",
+                   (now_sec() - t0) * 1000.0);
+        return true;
+    }
+    if (server_image_disk_get(&s->image_cache, path, input, dim, out)) {
+        server_image_cache_put(&s->image_cache, input, out, dim, SERVER_IMAGE_CACHE_BYTES);
+        free(path);
+        server_log(DS4_LOG_KVCACHE, "ds4-server: vision embedding cache hit source=disk %.1f ms",
+                   (now_sec() - t0) * 1000.0);
         return true;
     }
     if (!ds4_engine_vision_encode_memory(s->engine, input->encoded,
-                                         input->encoded_len, out, err, errlen))
+                                         input->encoded_len, out, err, errlen)) {
+        free(path);
         return false;
+    }
     /* Row width must match the encoder's allocation: the mmproj projection
      * dim is validated to equal the model's n_embd at load (Qwen3.8 is
      * 2560-wide, not 4096; a wrong width over-reads the source in put). */
-    server_image_cache_put(&s->image_cache, input, out,
-                            (uint32_t)ds4_engine_embd_dim(s->engine),
-                            SERVER_IMAGE_CACHE_BYTES);
-    server_log(DS4_LOG_KVCACHE, "ds4-server: vision embedding encoded; cache=%zu bytes",
-               s->image_cache.bytes);
+    server_image_cache_put(&s->image_cache, input, out, dim, SERVER_IMAGE_CACHE_BYTES);
+    bool stored = server_image_disk_put(&s->image_cache, path, input, out, dim);
+    server_log(DS4_LOG_KVCACHE,
+               "ds4-server: vision embedding encoded; cache=%zu bytes disk=%s %.1f ms",
+               s->image_cache.bytes, stored ? "stored" : (path ? "write-failed" : "disabled"),
+               (now_sec() - t0) * 1000.0);
+    free(path);
     return true;
 }
 
@@ -10448,7 +11000,7 @@ static void live_tool_state_clear_locked(live_tool_state *st) {
     free(st->visible_text);
     st->visible_text = NULL;
     st->visible_len = 0;
-    memset(&st->images, 0, sizeof(st->images));
+    visible_image_key_free(&st->images);
     st->valid = false;
     st->live_tokens = 0;
 }
@@ -10465,7 +11017,7 @@ static void visible_live_clear_locked(visible_live_state *st) {
     free(st->visible_text);
     st->visible_text = NULL;
     st->visible_len = 0;
-    memset(&st->images, 0, sizeof(st->images));
+    visible_image_key_free(&st->images);
     st->live_tokens = 0;
     st->valid = false;
     st->token_text_disk_key = false;
@@ -11270,7 +11822,9 @@ static bool kv_cache_store_live_prefix_text(server *s, server_slot *slot,
      * placeholder tokens become a cache hit for a different image.
      * sync_image_count covers progress-callback writes during prefill;
      * checkpoint_image_count covers completed sessions. */
-    if (ds4_session_has_vision_state(slot->session)) {
+    if (ds4_session_has_vision_state(slot->session) &&
+        (!ds4_engine_is_deepseek41(s->engine) || !cache_text_key ||
+         strcmp(cache_text_key, "vision-prefix") != 0)) {
         pthread_mutex_unlock(&s->inference_mu);
         return false;
     }
@@ -11403,6 +11957,7 @@ static void kv_cache_discard_failed_disk_entry(server *s, server_slot *slot,
 
 static void kv_cache_maybe_store_continued(server *s, server_slot *slot) {
     if (!s || !slot) return;
+    if (!ds4_session_checkpoint_valid(slot->session)) return;
     kv_disk_cache *kc = &s->kv;
     const ds4_tokens *tokens = ds4_session_tokens(slot->session);
     if (!tokens) return;
@@ -11453,10 +12008,41 @@ static int kv_cache_try_load_text(server *s, server_slot *slot,
     return loaded;
 }
 
+static bool build_live_prompt_suffix(server *s, server_slot *slot,
+                                      const request *req, const char *suffix,
+                                      ds4_tokens *out);
+
 static int kv_cache_try_load(server *s, server_slot *slot, const request *req,
                              ds4_tokens *effective_prompt,
                              char **loaded_path_out,
                              uint8_t *loaded_ext_flags_out) {
+    if (req && ds4_engine_is_deepseek41(s->engine)) {
+        char *key = vision_disk_prompt_key(req);
+        if (!key) return 0;
+        ds4_kvstore_load_result lr = {0};
+        ds4_kvstore_trailer_hooks hooks = kv_cache_tool_map_hooks(s, NULL);
+        pthread_mutex_lock(&s->inference_mu);
+        pthread_mutex_lock(&s->kv_mu);
+        int loaded = ds4_kvstore_try_load_text(&s->kv, s->engine, slot->session,
+                                               key, NULL, &lr, &hooks,
+                                               req->api == API_RESPONSES);
+        pthread_mutex_unlock(&s->kv_mu);
+        if (loaded > 0 && !build_live_prompt_suffix(s, slot, req,
+                              req->prompt_text + lr.text_bytes, effective_prompt)) {
+            /* A matching lookup key alone cannot authorize image reuse. */
+            ds4_session_invalidate(slot->session);
+            loaded = 0;
+            server_log(DS4_LOG_KVCACHE, "ds4-server: disk prefix rejected: image identity/position mismatch");
+        }
+        pthread_mutex_unlock(&s->inference_mu);
+        if (loaded > 0) {
+            if (loaded_path_out && lr.path) *loaded_path_out = xstrdup(lr.path);
+            if (loaded_ext_flags_out) *loaded_ext_flags_out = lr.ext_flags;
+        }
+        ds4_kvstore_load_result_free(&lr);
+        free(key);
+        return loaded;
+    }
     return kv_cache_try_load_text(s, slot, req ? req->prompt_text : NULL,
                                   effective_prompt,
                                   loaded_path_out,
@@ -11468,12 +12054,11 @@ static int kv_cache_try_load(server *s, server_slot *slot, const request *req,
  * Keep the exact live tokens and splice each new image's already-built token
  * block into the suffix. Historical image positions follow the live frontier,
  * which may retain reasoning omitted from a client's visible replay. */
-static bool build_live_prompt_suffix(server *s, server_slot *slot,
+static bool build_live_prompt_suffix_spans(server *s, server_slot *slot,
                                       const request *req, const char *suffix,
-                                      ds4_tokens *out) {
+                                      ds4_tokens *out, ds4_vision_span *spans) {
     const ds4_tokens *live = ds4_session_tokens(slot->session);
-    if (!live || !suffix || req->image_count > 16) return false;
-    ds4_vision_span spans[16];
+    if (!live || !suffix) return false;
     size_t old_count = req->image_count;
     for (size_t i = 0; i < req->image_count; i++) {
         if (!req->image_markers) return false;
@@ -11515,6 +12100,16 @@ static bool build_live_prompt_suffix(server *s, server_slot *slot,
     return true;
 }
 
+static bool build_live_prompt_suffix(server *s, server_slot *slot,
+                                      const request *req, const char *suffix,
+                                      ds4_tokens *out) {
+    if (req->image_count > SIZE_MAX / sizeof(ds4_vision_span)) return false;
+    ds4_vision_span *spans = req->image_count ?
+        xmalloc(req->image_count * sizeof(*spans)) : NULL;
+    const bool ok = build_live_prompt_suffix_spans(s, slot, req, suffix, out, spans);
+    free(spans);
+    return ok;
+}
 
 
 /* =========================================================================
@@ -11641,10 +12236,12 @@ static slot_reuse slot_probe_reuse_locked(server *s, server_slot *slot,
                 pr.reuse_tokens = live_pos;
                 pr.suffix_off = slot->responses_live.visible_len;
                 free(vkey);
+                visible_image_key_free(&vimages);
                 return pr;
             }
             free(vkey);
         }
+        visible_image_key_free(&vimages);
     }
 
     if (req->api == API_RESPONSES && req->responses_live_suffix_text &&
@@ -11707,10 +12304,12 @@ static slot_reuse slot_probe_reuse_locked(server *s, server_slot *slot,
                 pr.reuse_tokens = live_pos;
                 pr.suffix_off = slot->thinking_live.visible_len;
                 free(vkey);
+                visible_image_key_free(&vimages);
                 return pr;
             }
             free(vkey);
         }
+        visible_image_key_free(&vimages);
     }
 
     if (ptext && slot->live_text && slot->live_text_pos == live_pos &&
@@ -12409,7 +13008,8 @@ static void server_prefill_leave(server *s) {
 
 static int server_prefill_quantum_for(const server *s,
                                       bool generation_active) {
-    int quantum = generation_active ? s->mixed_prefill_quantum : 2048;
+    int quantum = generation_active ? s->mixed_prefill_quantum :
+        (int)ds4_engine_prefill_quantum(s->engine, s->ctx_size);
     if (generation_active && quantum < 1024 && s->engine &&
         ds4_engine_is_glm53(s->engine)) {
         quantum = 1024;
@@ -12435,6 +13035,7 @@ static int server_session_sync(server *s, server_slot *slot,
     if (!s->batched_mode) {
         if (!server_prefill_enter(s, slot)) return DS4_SESSION_SYNC_INTERRUPTED;
         int rc = ds4_session_sync(slot->session, prompt, err, errlen);
+        if (rc == 0 && s->tp_leader) kv_cache_maybe_store_continued(s, slot);
         server_prefill_leave(s);
         return rc;
     }
@@ -12458,6 +13059,9 @@ static int server_session_sync(server *s, server_slot *slot,
         if (!server_prefill_enter(s, slot)) return DS4_SESSION_SYNC_INTERRUPTED;
         int rc = ds4_session_sync(slot->session, &prefix, err, errlen);
         if (rc == 0) done = ds4_session_pos(slot->session);
+        /* Both ranks have acknowledged SYNC here. A progress callback still
+         * runs inside its lockstep protocol and cannot send a SAVE command. */
+        if (rc == 0 && s->tp_leader) kv_cache_maybe_store_continued(s, slot);
         server_prefill_leave(s);
         called = true;
         if (rc != 0) return rc;
@@ -12697,7 +13301,7 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
     if (is_display) return;
     double elapsed = now - p->t0;
     if (p->seen && current == p->last_current) {
-        if (p->srv && p->slot && current > p->cached_tokens) {
+        if (p->srv && !p->srv->tp_leader && p->slot && current > p->cached_tokens) {
             kv_cache_maybe_store_continued(p->srv, p->slot);
         }
         return;
@@ -12738,7 +13342,7 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
                chunk_tps,
                avg_tps,
                elapsed);
-    if (p->srv && p->slot && current > p->cached_tokens) {
+    if (p->srv && !p->srv->tp_leader && p->slot && current > p->cached_tokens) {
         kv_cache_maybe_store_continued(p->srv, p->slot);
     }
 }
@@ -13591,14 +14195,14 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                    j->req.image_count, cached, prompt_for_sync->len);
     }
     if (cached == 0) slot->continued_last_store_tokens = 0;
-    if (!multimodal && s->kv.enabled && cached == 0 &&
-        old_pos >= s->kv.opt.min_tokens) {
+    if ((!multimodal || ds4_engine_is_deepseek41(s->engine)) &&
+        s->kv.enabled && cached == 0 && old_pos >= s->kv.opt.min_tokens) {
         /* Loading a disk snapshot replaces the live Metal session.  Persist the
          * current checkpoint first, otherwise a cache hit for an older prefix
          * would silently discard the newer conversation state. */
         kv_cache_store_current(s, slot, "evict");
     }
-    if (!multimodal && cached == 0) {
+    if ((!multimodal || ds4_engine_is_deepseek41(s->engine)) && cached == 0) {
         disk_cached = kv_cache_try_load(s, slot, &j->req, &effective_prompt,
                                         &disk_cache_path,
                                         &disk_cache_ext_flags);
@@ -13793,6 +14397,19 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     ds4_session_set_progress(slot->session, NULL, NULL);
     ds4_session_set_display_progress(slot->session, NULL, NULL);
     if (!multimodal) kv_cache_maybe_store_continued(s, slot);
+    /* Preserve the completed input frontier before tool serialization or a
+     * later image changes the visible suffix. Both ranks are idle here, unlike
+     * a layer-sweep progress callback. Restoring it only evaluates that suffix. */
+    if (ds4_engine_is_deepseek41(s->engine) && s->kv.enabled &&
+        cached < prompt_for_sync->len && prompt_for_sync->len >= s->kv.opt.min_tokens) {
+        char *key = vision_disk_prompt_key(&j->req);
+        if (key) {
+            kv_cache_store_live_prefix_text(s, slot, prompt_for_sync, prompt_for_sync->len,
+                                            "prefill", key, 0,
+                                            multimodal ? "vision-prefix" : "request-prefix");
+            free(key);
+        }
+    }
     server_log(DS4_LOG_PREFILL,
                "ds4-server: %s ctx=%s%s%s prompt done %.3fs",
                j->req.kind == REQ_CHAT ? "chat" : "completion",
@@ -14989,6 +15606,9 @@ static void *slot_worker_main(void *arg) {
 typedef struct {
     char method[8];
     char path[256];
+    char query[1024];
+    char content_type[256];
+    bool unauthorized;
     char *body;
     size_t body_len;
 } http_request;
@@ -15008,28 +15628,197 @@ static ssize_t header_end(const char *p, size_t n) {
     return -1;
 }
 
-static long content_length(const char *h, size_t n) {
+static bool http_field_name_char(unsigned char c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+           (c >= '0' && c <= '9') || (c && strchr("!#$%&'*+-.^_`|~", c));
+}
+
+/* Keep framing unambiguous before reading a potentially large image body.
+ * Transfer-Encoding is independent of JSON streaming and image MIME types. */
+static bool http_body_framing(const char *h, size_t n, size_t limit,
+                              size_t *length, bool *chunked) {
     const char *p = h, *end = h + n;
+    bool first = true, have_length = false, have_encoding = false;
+    *length = 0;
+    *chunked = false;
+    if (memchr(h, '\0', n)) return false;
     while (p < end) {
         const char *line = p;
         while (p < end && *p != '\n') p++;
         size_t len = (size_t)(p - line);
         if (len && line[len - 1] == '\r') len--;
-        if (len >= 15 && strncasecmp(line, "Content-Length:", 15) == 0) {
-            const char *v = line + 15;
-            while (v < line + len && isspace((unsigned char)*v)) v++;
-            return strtol(v, NULL, 10);
-        }
         if (p < end) p++;
+        if (first) { first = false; continue; }
+        if (!len) break;
+        const char *colon = memchr(line, ':', len);
+        if (!colon || colon == line) return false;
+        for (const char *k = line; k < colon; k++)
+            if (!http_field_name_char((unsigned char)*k)) return false;
+        const char *v = colon + 1, *vend = line + len;
+        while (v < vend && (*v == ' ' || *v == '\t')) v++;
+        while (vend > v && (vend[-1] == ' ' || vend[-1] == '\t')) vend--;
+        const size_t key_len = (size_t)(colon - line);
+        if (key_len == 14 && !strncasecmp(line, "Content-Length", 14)) {
+            if (have_length || v == vend) return false;
+            have_length = true;
+            size_t value = 0;
+            for (; v < vend; v++) {
+                if (*v < '0' || *v > '9') return false;
+                const unsigned digit = (unsigned)(*v - '0');
+                if (value > limit / 10 ||
+                    (value == limit / 10 && digit > limit % 10)) return false;
+                value = value * 10 + digit;
+            }
+            *length = value;
+        } else if (key_len == 17 && !strncasecmp(line, "Transfer-Encoding", 17)) {
+            if (have_encoding || vend - v != 7 || strncasecmp(v, "chunked", 7))
+                return false;
+            have_encoding = *chunked = true;
+        }
     }
-    return 0;
+    return !(have_length && have_encoding);
+}
+
+typedef struct {
+    int fd;
+    char data[8192];
+    size_t pos, len;
+} http_body_reader;
+
+static bool http_body_read(http_body_reader *r, void *out, size_t count) {
+    char *dst = out;
+    while (count) {
+        if (r->pos == r->len) {
+            ssize_t n;
+            do { n = recv(r->fd, r->data, sizeof(r->data), 0); }
+            while (n < 0 && errno == EINTR);
+            if (n <= 0) return false;
+            r->pos = 0;
+            r->len = (size_t)n;
+        }
+        size_t take = r->len - r->pos;
+        if (take > count) take = count;
+        memcpy(dst, r->data + r->pos, take);
+        dst += take; r->pos += take; count -= take;
+    }
+    return true;
+}
+
+static bool http_body_line(http_body_reader *r, char *line, size_t cap, size_t *len) {
+    size_t n = 0;
+    char c;
+    while (http_body_read(r, &c, 1)) {
+        if (c == '\r') {
+            if (!http_body_read(r, &c, 1) || c != '\n') return false;
+            line[n] = '\0';
+            *len = n;
+            return true;
+        }
+        if (c == '\n' || c == '\0' || n + 1 >= cap) return false;
+        line[n++] = c;
+    }
+    return false;
+}
+
+static bool http_chunked_body(http_body_reader *reader, size_t limit, buf *body) {
+    char line[8192];
+    size_t len;
+    for (;;) {
+        if (!http_body_line(reader, line, sizeof(line), &len)) return false;
+        size_t count = 0, i = 0;
+        for (; i < len; i++) {
+            unsigned char c = (unsigned char)line[i];
+            unsigned digit;
+            if (c >= '0' && c <= '9') digit = c - '0';
+            else if (c >= 'a' && c <= 'f') digit = c - 'a' + 10;
+            else if (c >= 'A' && c <= 'F') digit = c - 'A' + 10;
+            else break;
+            const size_t remaining = limit - body->len;
+            if (count > remaining / 16 ||
+                (count == remaining / 16 && digit > remaining % 16)) return false;
+            count = count * 16 + digit;
+        }
+        if (!i) return false;
+        while (i < len && (line[i] == ' ' || line[i] == '\t')) i++;
+        if (i < len && line[i] != ';') return false;
+        /* Unknown chunk extensions are ignored, with a bounded line length. */
+        for (; i < len; i++)
+            if (((unsigned char)line[i] < 32 && line[i] != '\t') || line[i] == 127)
+                return false;
+        if (!count) break;
+        buf_reserve(body, count);
+        if (!http_body_read(reader, body->ptr + body->len, count)) return false;
+        body->len += count;
+        body->ptr[body->len] = '\0';
+        char crlf[2];
+        if (!http_body_read(reader, crlf, 2) || memcmp(crlf, "\r\n", 2)) return false;
+    }
+    /* Consume trailers, but never let them alter the request's framing. */
+    size_t trailers = 0;
+    for (;;) {
+        if (!http_body_line(reader, line, sizeof(line), &len)) return false;
+        if (len + 2 > 64 * 1024 - trailers) return false;
+        trailers += len + 2;
+        if (!len) return true;
+        char *colon = strchr(line, ':');
+        if (!colon || colon == line) return false;
+        for (char *k = line; k < colon; k++)
+            if (!http_field_name_char((unsigned char)*k)) return false;
+        if ((colon - line == 14 && !strncasecmp(line, "Content-Length", 14)) ||
+            (colon - line == 17 && !strncasecmp(line, "Transfer-Encoding", 17))) return false;
+    }
+}
+
+static bool file_header_value(const char *, size_t, const char *, char *, size_t);
+
+/* Authenticate headers before reading a potentially large image/upload body.
+ * If both client conventions are present, both must match. Credentials never
+ * enter request diagnostics, raw-body snapshots or the inference queue. */
+static bool http_api_key_equal(const char *value, size_t len) {
+    size_t expected = strlen(server_api_key);
+    if (len != expected) return false;
+    unsigned char diff = 0;
+    for (size_t i = 0; i < len; i++) diff |= (unsigned char)value[i] ^ (unsigned char)server_api_key[i];
+    return diff == 0;
+}
+
+static bool http_authorized(const char *headers, size_t len) {
+    if (!server_api_key) return true;
+    const char *p = headers, *end = headers + len;
+    bool bearer = false, api_key = false;
+    while (p < end) {
+        const char *nl = memchr(p, '\n', (size_t)(end-p));
+        const char *stop = nl ? nl : end;
+        if (stop > p && stop[-1] == '\r') stop--;
+        const char *colon = memchr(p, ':', (size_t)(stop-p));
+        if (colon) {
+            size_t name_len = (size_t)(colon-p);
+            bool auth = name_len == 13 && !strncasecmp(p, "Authorization", 13);
+            bool xkey = name_len == 9 && !strncasecmp(p, "x-api-key", 9);
+            if (auth || xkey) {
+                if ((auth && bearer) || (xkey && api_key)) return false;
+                const char *v = colon + 1;
+                while (v < stop && (*v == ' ' || *v == '\t')) v++;
+                while (stop > v && (stop[-1] == ' ' || stop[-1] == '\t')) stop--;
+                if (auth) {
+                    if (stop-v < 7 || strncasecmp(v, "Bearer", 6) ||
+                        (v[6] != ' ' && v[6] != '\t')) return false;
+                    v += 7; while (v < stop && (*v == ' ' || *v == '\t')) v++;
+                    bearer = true;
+                } else api_key = true;
+                if (!http_api_key_equal(v, (size_t)(stop-v))) return false;
+            }
+        }
+        p = nl ? nl + 1 : end;
+    }
+    return bearer || api_key;
 }
 
 static bool read_http_request(int fd, http_request *r) {
     buf b = {0};
     ssize_t hend = -1;
     const size_t max_header = 64 * 1024;
-    const size_t max_body = 64 * 1024 * 1024;
+    size_t max_body = 1024u * 1024u * 1024u;
 
     while (hend < 0 && b.len < max_header) {
         char tmp[4096];
@@ -15039,7 +15828,7 @@ static bool read_http_request(int fd, http_request *r) {
         buf_append(&b, tmp, (size_t)n);
         hend = header_end(b.ptr, b.len);
     }
-    if (hend < 0) goto fail;
+    if (hend < 0 || (size_t)hend > max_header) goto fail;
 
     char line[512];
     size_t i = 0;
@@ -15050,27 +15839,283 @@ static bool read_http_request(int fd, http_request *r) {
     line[i] = '\0';
     if (sscanf(line, "%7s %255s", r->method, r->path) != 2) goto fail;
     char *q = strchr(r->path, '?');
-    if (q) *q = '\0';
-
-    long clen = content_length(b.ptr, (size_t)hend);
-    if (clen < 0 || (size_t)clen > max_body) goto fail;
-    while (b.len < (size_t)hend + (size_t)clen) {
-        char tmp[8192];
-        ssize_t n = recv(fd, tmp, sizeof(tmp), 0);
-        if (n < 0 && errno == EINTR) continue;
-        if (n <= 0) goto fail;
-        buf_append(&b, tmp, (size_t)n);
+    if (q) {
+        snprintf(r->query, sizeof(r->query), "%s", q + 1);
+        *q = '\0';
     }
+    if (!file_header_value(b.ptr, (size_t)hend, "Content-Type", r->content_type, sizeof(r->content_type)))
+        r->content_type[0] = 0;
 
-    r->body_len = (size_t)clen;
-    r->body = xmalloc(r->body_len + 1);
-    memcpy(r->body, b.ptr + hend, r->body_len);
-    r->body[r->body_len] = '\0';
+    if (!strcmp(r->path, "/v1/files")) max_body = SERVER_FILE_MAX_BYTES + 16384u;
+    size_t length;
+    bool chunked;
+    if (!http_body_framing(b.ptr, (size_t)hend, max_body, &length, &chunked)) goto fail;
+    if (strcmp(r->method, "OPTIONS") && !http_authorized(b.ptr, (size_t)hend)) {
+        r->unauthorized = true;
+        buf_free(&b);
+        return true;
+    }
+    http_body_reader reader = {.fd = fd, .len = b.len - (size_t)hend};
+    if (reader.len > sizeof(reader.data)) goto fail;
+    memcpy(reader.data, b.ptr + hend, reader.len);
     buf_free(&b);
+    if (chunked) {
+        buf body = {0};
+        if (!http_chunked_body(&reader, max_body, &body)) {
+            buf_free(&body);
+            goto fail;
+        }
+        r->body_len = body.len;
+        r->body = buf_take(&body);
+    } else {
+        r->body_len = length;
+        r->body = xmalloc(length + 1);
+        if (!http_body_read(&reader, r->body, length)) goto fail;
+        r->body[length] = '\0';
+    }
     return true;
 fail:
     buf_free(&b);
+    http_request_free(r);
     return false;
+}
+
+/* MIME parameters are parsed rather than substring-matched: filenames can
+ * contain semicolons and quoted escapes, and binary data can contain NULs. */
+static bool file_parameter(const char *value, const char *wanted, char *out, size_t cap) {
+    const char *p = strchr(value, ';'); bool found = false;
+    while (p && *p) {
+        p++; while (*p == ' ' || *p == '\t') p++;
+        const char *key = p;
+        while (http_field_name_char((unsigned char)*p)) p++;
+        size_t key_len = (size_t)(p - key);
+        while (*p == ' ' || *p == '\t') p++;
+        if (!key_len || *p++ != '=') return false;
+        while (*p == ' ' || *p == '\t') p++;
+        buf v = {0};
+        if (*p == '"') {
+            p++;
+            while (*p && *p != '"') {
+                if (*p == '\\') { p++; if (!*p) break; }
+                if ((unsigned char)*p < 32 || *p == 127) { buf_free(&v); return false; }
+                buf_putc(&v, *p++);
+            }
+            if (*p != '"') { buf_free(&v); return false; }
+            p++;
+        } else {
+            while (*p && *p != ';' && *p != ' ' && *p != '\t') buf_putc(&v, *p++);
+        }
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p && *p != ';') { buf_free(&v); return false; }
+        if (strlen(wanted) == key_len && !strncasecmp(key, wanted, key_len)) {
+            if (found || !v.len || v.len >= cap) { buf_free(&v); return false; }
+            memcpy(out, v.ptr, v.len); out[v.len] = 0; found = true;
+        }
+        buf_free(&v);
+    }
+    return found;
+}
+
+static bool file_header_value(const char *p, size_t n, const char *name,
+                               char *out, size_t cap) {
+    bool found = false;
+    const char *end = p + n;
+    while (p < end) {
+        const char *nl = memchr(p, '\n', (size_t)(end - p));
+        const char *stop = nl ? nl : end;
+        if (stop > p && stop[-1] == '\r') stop--;
+        const char *colon = memchr(p, ':', (size_t)(stop - p));
+        if (colon && (size_t)(colon - p) == strlen(name) && !strncasecmp(p, name, strlen(name))) {
+            const char *v = colon + 1;
+            while (v < stop && (*v == ' ' || *v == '\t')) v++;
+            while (stop > v && (stop[-1] == ' ' || stop[-1] == '\t')) stop--;
+            size_t len = (size_t)(stop - v);
+            if (found || len >= cap || memchr(v, 0, len)) return false;
+            memcpy(out, v, len); out[len] = 0; found = true;
+        }
+        p = nl ? nl + 1 : end;
+    }
+    return found;
+}
+
+typedef struct { const uint8_t *data; size_t len; server_file_record record; } file_upload;
+static bool file_multipart(const http_request *r, file_upload *upload) {
+    char boundary[72];
+    if (strncasecmp(r->content_type, "multipart/form-data", 19) ||
+        (r->content_type[19] != ';' && r->content_type[19] != ' ') ||
+        !file_parameter(r->content_type, "boundary", boundary, sizeof(boundary))) return false;
+    buf delimiter = {0}; buf_printf(&delimiter, "\r\n--%s", boundary);
+    const char *p = r->body, *end = p + r->body_len;
+    bool have_file = false, have_purpose = false, ok = false;
+    if ((size_t)(end-p) < delimiter.len - 2 || memcmp(p, delimiter.ptr + 2, delimiter.len - 2)) goto done;
+    p += delimiter.len - 2;
+    while (p < end) {
+        if (end-p < 2) goto done;
+        if (!memcmp(p, "--", 2)) {
+            p += 2;
+            if (end-p == 2 && !memcmp(p, "\r\n", 2)) p += 2;
+            ok = p == end && have_file; goto done;
+        }
+        if (memcmp(p, "\r\n", 2)) goto done;
+        p += 2;
+        const char *he = memmem(p, (size_t)(end-p), "\r\n\r\n", 4);
+        if (!he || he-p > 8192 || memchr(p, 0, (size_t)(he-p))) goto done;
+        char disposition[1024], name[64];
+        if (!file_header_value(p, (size_t)(he-p), "Content-Disposition", disposition, sizeof(disposition)) ||
+            strncasecmp(disposition, "form-data;", 10) ||
+            !file_parameter(disposition, "name", name, sizeof(name))) goto done;
+        p = he + 4;
+        const char *next = p;
+        /* A boundary prefix inside image bytes is data unless followed by the
+         * delimiter's CRLF or closing '--'. */
+        for (;;) {
+            next = memmem(next, (size_t)(end-next), delimiter.ptr, delimiter.len);
+            if (!next || (size_t)(end-next) < delimiter.len + 2) goto done;
+            const char *tail = next + delimiter.len;
+            if (!memcmp(tail, "\r\n", 2) || !memcmp(tail, "--", 2)) break;
+            next++;
+        }
+        size_t len = (size_t)(next-p);
+        if (!strcmp(name, "file")) {
+            if (have_file || !len || len > SERVER_FILE_MAX_BYTES ||
+                !file_parameter(disposition, "filename", upload->record.filename, sizeof(upload->record.filename))) goto done;
+            upload->data = (const uint8_t *)p; upload->len = len; have_file = true;
+        } else if (!strcmp(name, "purpose")) {
+            if (have_purpose || !len || len >= sizeof(upload->record.purpose) || memchr(p, 0, len)) goto done;
+            memcpy(upload->record.purpose, p, len); upload->record.purpose[len] = 0; have_purpose = true;
+        }
+        /* Client metadata such as expires_after[...] is optional. Ignore
+         * unknown fields; file lifetime remains governed by local LRU. */
+        p = next + delimiter.len;
+    }
+done:
+    buf_free(&delimiter);
+    if (!have_purpose) snprintf(upload->record.purpose, sizeof(upload->record.purpose), "vision");
+    return ok && (!strcmp(upload->record.purpose, "vision") ||
+                  !strcmp(upload->record.purpose, "user_data") ||
+                  !strcmp(upload->record.purpose, "assistants"));
+}
+
+typedef struct { char id[38]; server_file_record record; } file_listing;
+static int file_listing_compare(const void *a, const void *b) {
+    const file_listing *x = a, *y = b;
+    if (x->record.created_at != y->record.created_at)
+        return x->record.created_at < y->record.created_at ? -1 : 1;
+    return strcmp(x->id, y->id);
+}
+
+static bool server_files_list(int fd, bool cors, const char *query) {
+    char *params = xstrdup(query), *save = NULL;
+    size_t limit = 100; bool desc = true, ok = true;
+    char after[38] = "", purpose[32] = "";
+    unsigned seen = 0;
+    for (char *p = strtok_r(params, "&", &save); p; p = strtok_r(NULL, "&", &save)) {
+        char *eq = strchr(p, '='); if (!eq) { ok = false; break; } *eq++ = 0;
+        unsigned bit = 0;
+        if (!strcmp(p, "limit")) {
+            bit = 1; char *end; unsigned long n = strtoul(eq, &end, 10);
+            if (!*eq || *end || n < 1 || n > 10000) { ok = false; break; } limit = n;
+        } else if (!strcmp(p, "after")) {
+            bit = 2; if (!server_file_id_valid(eq)) { ok = false; break; } strcpy(after, eq);
+        } else if (!strcmp(p, "order")) {
+            bit = 4; if (strcmp(eq, "asc") && strcmp(eq, "desc")) { ok = false; break; } desc = !strcmp(eq, "desc");
+        } else if (!strcmp(p, "purpose")) {
+            bit = 8; if (strlen(eq) >= sizeof(purpose)) { ok = false; break; } strcpy(purpose, eq);
+        } else { ok = false; break; }
+        if (seen & bit) { ok = false; break; } seen |= bit;
+    }
+    free(params);
+    if (!ok) return http_error(fd, cors, 400, "invalid file list pagination/filter");
+    pthread_mutex_lock(&server_files_mu);
+    DIR *dir = opendir(server_files_dir);
+    file_listing *items = NULL; size_t count = 0;
+    if (dir) {
+        struct dirent *e;
+        while ((e = readdir(dir))) {
+            server_file_record rec;
+            if (!server_file_read(e->d_name, &rec, NULL) || (purpose[0] && strcmp(rec.purpose, purpose))) continue;
+            items = xrealloc(items, (count+1) * sizeof(*items));
+            strcpy(items[count].id, e->d_name); items[count++].record = rec;
+        }
+        closedir(dir);
+    }
+    pthread_mutex_unlock(&server_files_mu);
+    if (!dir) { free(items); return http_error(fd, cors, 500, "cannot read file storage"); }
+    if (count) qsort(items, count, sizeof(*items), file_listing_compare);
+    bool started = !after[0], more = false;
+    size_t emitted = 0; const char *first = NULL, *last = NULL;
+    buf out = {0}; buf_puts(&out, "{\"object\":\"list\",\"data\":[");
+    for (size_t i = 0; i < count; i++) {
+        file_listing *item = &items[desc ? count-1-i : i];
+        if (!started) { if (!strcmp(item->id, after)) started = true; continue; }
+        if (emitted == limit) { more = true; break; }
+        if (emitted++) buf_putc(&out, ',');
+        if (!first) first = item->id;
+        last = item->id; server_file_json(&out, item->id, &item->record);
+    }
+    if (!started) { buf_free(&out); free(items); return http_error(fd, cors, 400, "file list cursor not found"); }
+    buf_puts(&out, "],\"first_id\":"); if (first) json_escape(&out, first); else buf_puts(&out, "null");
+    buf_puts(&out, ",\"last_id\":"); if (last) json_escape(&out, last); else buf_puts(&out, "null");
+    buf_printf(&out, ",\"has_more\":%s}", more ? "true" : "false");
+    ok = http_response(fd, cors, 200, "application/json", out.ptr);
+    buf_free(&out); free(items); return ok;
+}
+
+static void server_files_http(int fd, bool cors, const http_request *r) {
+    if (!server_files_dir) { http_error(fd, cors, 503, "image file storage is not configured"); return; }
+    if (!strcmp(r->path, "/v1/files")) {
+        if (!strcmp(r->method, "GET")) { server_files_list(fd, cors, r->query); return; }
+        if (strcmp(r->method, "POST")) { http_error(fd, cors, 405, "method not allowed"); return; }
+        file_upload upload = {0};
+        if (!file_multipart(r, &upload)) {
+            http_error(fd, cors, 400, "expected multipart file (PNG/JPEG/WebP, up to 48 MiB) and purpose vision/user_data/assistants"); return;
+        }
+        const char *mime = server_file_mime(upload.data, upload.len);
+        ds4_image image = {0}; char err[160];
+        if (!mime || !ds4_image_decode_memory(&image, upload.data, upload.len, err, sizeof(err))) {
+            ds4_image_free(&image); http_error(fd, cors, 400, "file must be a valid PNG, JPEG or WebP image"); return;
+        }
+        ds4_image_free(&image);
+        memcpy(upload.record.magic, "DS4FIL1", 8);
+        upload.record.bytes = upload.len; upload.record.created_at = (uint64_t)time(NULL);
+        snprintf(upload.record.mime, sizeof(upload.record.mime), "%s", mime);
+        char id[38]; server_file_error[0] = 0;
+        pthread_mutex_lock(&server_files_mu);
+        bool stored = server_file_store(upload.data, upload.len, &upload.record, id);
+        pthread_mutex_unlock(&server_files_mu);
+        if (!stored) { http_error(fd, cors, 500, server_file_error[0] ? server_file_error : "cannot persist image file"); return; }
+        buf out = {0}; server_file_json(&out, id, &upload.record);
+        http_response(fd, cors, 200, "application/json", out.ptr); buf_free(&out); return;
+    }
+    const char *tail = r->path + strlen("/v1/files/");
+    char id[38]; const char *slash = strchr(tail, '/');
+    size_t len = slash ? (size_t)(slash-tail) : strlen(tail);
+    if (len != 37) { http_error(fd, cors, 404, "file not found"); return; }
+    memcpy(id, tail, len); id[len] = 0;
+    bool content = slash && !strcmp(slash, "/content");
+    if (slash && !content) { http_error(fd, cors, 404, "unknown file endpoint"); return; }
+    server_file_record record; uint8_t *data = NULL;
+    if (!strcmp(r->method, "DELETE") && !content) {
+        char *path = server_file_path(id);
+        pthread_mutex_lock(&server_files_mu);
+        bool deleted = path && !unlink(path);
+        if (deleted) { int d = open(server_files_dir, O_RDONLY | O_DIRECTORY); if (d >= 0) { fsync(d); close(d); } }
+        pthread_mutex_unlock(&server_files_mu); free(path);
+        if (!deleted) { http_error(fd, cors, 404, "file not found"); return; }
+        buf out = {0}; buf_puts(&out, "{\"object\":\"file\",\"deleted\":true,\"id\":");
+        json_escape(&out, id); buf_putc(&out, '}');
+        http_response(fd, cors, 200, "application/json", out.ptr); buf_free(&out); return;
+    }
+    if (strcmp(r->method, "GET")) { http_error(fd, cors, 405, "method not allowed"); return; }
+    if (!server_file_read(id, &record, content ? &data : NULL)) { http_error(fd, cors, 404, "file not found"); return; }
+    buf out = {0};
+    if (content) {
+        buf_printf(&out, "HTTP/1.1 200 OK\r\nContent-Type: %s\r\nContent-Length: %llu\r\n", record.mime, (unsigned long long)record.bytes);
+        if (cors) append_cors_headers(&out);
+        buf_puts(&out, "Connection: close\r\n\r\n");
+        if (send_all(fd, out.ptr, out.len)) send_all(fd, (const char *)data, (size_t)record.bytes);
+    } else { server_file_json(&out, id, &record); http_response(fd, cors, 200, "application/json", out.ptr); }
+    buf_free(&out); free(data);
 }
 
 typedef struct {
@@ -15275,10 +16320,18 @@ static void *client_main(void *arg) {
 
     http_request hr = {0};
     if (!read_http_request(fd, &hr)) {
+        server_log(DS4_LOG_WARNING, "ds4-server: HTTP 400: malformed or incomplete HTTP request");
         http_error(fd, s->enable_cors, 400, "bad HTTP request");
         goto done;
     }
 
+    if (hr.unauthorized) {
+        http_response(fd, s->enable_cors, 401, "application/json",
+            "{\"error\":{\"message\":\"Missing or invalid API key\","
+            "\"type\":\"authentication_error\",\"code\":\"invalid_api_key\"}}\n");
+        http_request_free(&hr);
+        goto done;
+    }
     if (!strcmp(hr.method, "OPTIONS")) {
         http_response(fd, s->enable_cors, 204, NULL, "");
         http_request_free(&hr);
@@ -15301,6 +16354,13 @@ static void *client_main(void *arg) {
         goto done;
     }
 
+    if (!strcmp(hr.path, "/v1/files") || !strncmp(hr.path, "/v1/files/", 10)) {
+        server_files_http(fd, s->enable_cors, &hr);
+        http_request_free(&hr);
+        goto done;
+    }
+    server_file_error[0] = 0;
+    server_missing_file_id[0] = 0;
     request req;
     char err[160];
     bool ok = false;
@@ -15322,10 +16382,16 @@ static void *client_main(void *arg) {
         http_request_free(&hr);
         goto done;
     }
+    if (!ok && server_file_error[0]) snprintf(err, sizeof(err), "%s", server_file_error);
+    if (!ok) server_log(DS4_LOG_WARNING, "ds4-server: HTTP 400 path=%s bytes=%zu: %s",
+                        hr.path, hr.body_len, err);
     if (ok) req.raw_body = xstrndup(hr.body, hr.body_len);
     http_request_free(&hr);
     if (!ok) {
-        http_error(fd, s->enable_cors, 400, err);
+        if (server_missing_file_id[0])
+            http_error_file_not_found(fd, s->enable_cors, server_missing_file_id);
+        else
+            http_error(fd, s->enable_cors, 400, err);
         goto done;
     }
     if (!req.model_from_request) {
@@ -15484,14 +16550,13 @@ static void log_context_memory(ds4_backend backend, int ctx_size,
                m.raw_cap,
                m.comp_cap);
     if (session_count > 1) {
-        /* Only the caches repeat per slot.  Where the model shares one prefill
-         * workspace across slots, the transients are paid once instead. */
+        /* Bounds only: each backend shares a different subset of scratch.
+         * The allocation logs below report what it actually reserves. */
         const double gib = 1024.0 * 1024.0 * 1024.0;
         const double caches = (double)(m.raw_bytes + m.compressed_bytes);
         server_log(DS4_LOG_DEFAULT,
-                   "ds4-server: %d resident sessions request at least %.2f GiB of "
-                   "context buffers, or %.2f GiB when the model shares one prefill "
-                   "workspace",
+                   "ds4-server: %d resident sessions: private-workspace estimate %.2f GiB; "
+                   "fully-shared-scratch lower bound %.2f GiB (backend allocation follows)",
                    session_count,
                    (double)m.total_bytes * (double)session_count / gib,
                    (caches * (double)session_count + (double)m.scratch_bytes) / gib);
@@ -15505,6 +16570,7 @@ static void server_close_resources(server *s) {
     kv_cache_close(&s->kv);
     tool_memory_free(&s->tool_mem);
     server_image_cache_clear(&s->image_cache);
+    free(s->image_cache.disk_dir);
     for (int i = 0; i < s->slot_count; i++) {
         server_slot *slot = &s->slots[i];
         live_tool_state_free(&slot->responses_live);
@@ -15833,6 +16899,15 @@ static void server_request_decode_stop(server *s) {
 }
 
 int main(int argc, char **argv) {
+    server_api_key = getenv("DS4_API_KEY");
+    if (server_api_key) {
+        size_t n = strlen(server_api_key);
+        if (n < 16 || n > 256) die("DS4_API_KEY must contain 16 to 256 printable non-space ASCII characters");
+        for (size_t i = 0; i < n; i++)
+            if ((unsigned char)server_api_key[i] < 33 || (unsigned char)server_api_key[i] > 126)
+                die("DS4_API_KEY must contain 16 to 256 printable non-space ASCII characters");
+        server_log(DS4_LOG_DEFAULT, "ds4-server: API key authentication enabled");
+    }
     signal(SIGPIPE, SIG_IGN);
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
@@ -15979,6 +17054,18 @@ int main(int argc, char **argv) {
     if (cfg.kv_disk_dir) {
         kv_cache_open(&s.kv, cfg.kv_disk_dir, cfg.kv_disk_space_mb,
                       cfg.kv_cache_reject_different_quant, cfg.kv_cache);
+    }
+    const char *files_env = getenv("DS4_FILES_DIR");
+    char *files_default = cfg.kv_disk_dir ? ds4_kvstore_path_join(cfg.kv_disk_dir, "uploaded-images") : NULL;
+    const char *files_dir = files_env && *files_env ? files_env : files_default;
+    if (files_dir && !server_files_open(files_dir)) die("cannot open image file storage");
+    if (server_files_dir) server_log(DS4_LOG_DEFAULT,
+        "ds4-server: image files dir=%s quota=64 GiB max_file=48 MiB policy=LRU eviction_batch=8 GiB", server_files_dir);
+    free(files_default);
+    if (s.kv.enabled && ds4_engine_has_vision(engine)) {
+        server_image_disk_open(&s.image_cache, s.kv.dir, cfg.engine.vision_path,
+                                 cfg.engine.backend, ds4_engine_model_id(engine),
+                                 (uint32_t)ds4_engine_embd_dim(engine));
     }
     if (s.disable_exact_dsml_tool_replay) {
         server_log(DS4_LOG_DEFAULT,
@@ -16645,6 +17732,7 @@ static void test_slot_probe_vision_tiers(void) {
         slot.thinking_live.visible_len =
             strlen(slot.thinking_live.visible_text);
         slot.thinking_live.images.count = 1;
+        slot.thinking_live.images.offsets = xmalloc(sizeof(size_t));
         slot.thinking_live.images.offsets[0] = 4;
         job j = {0};
         j.req.kind = REQ_CHAT;
@@ -17141,7 +18229,7 @@ static void test_cors_headers_are_opt_in(void) {
         char *out = read_socket_text(sv[1]);
         TEST_ASSERT(strstr(out, "HTTP/1.1 200 OK") != NULL);
         TEST_ASSERT(strstr(out, "Access-Control-Allow-Origin: *") != NULL);
-        TEST_ASSERT(strstr(out, "Access-Control-Allow-Methods: GET, POST, OPTIONS") != NULL);
+        TEST_ASSERT(strstr(out, "Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS") != NULL);
         TEST_ASSERT(strstr(out, "Access-Control-Allow-Headers: *") != NULL);
         free(out);
         close(sv[0]);
@@ -17509,6 +18597,43 @@ static void test_openai_stream_reroutes_second_reasoning_pass(void) {
     request_free(&r);
     close(sv[0]);
     close(sv[1]);
+}
+
+/* V4.1 must stream ordinary text after the explicit reasoning boundary,
+ * even when tools are advertised. Keep the legacy duplicate-close workaround
+ * for older model syntaxes, rather than buffering all V4.1 text until EOF. */
+static void test_deepseek41_text_stream_before_finish(void) {
+    const char *raw = "first pass</think>first answer chunk";
+    for (int api = 0; api < 2; api++) {
+        int sv[2];
+        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+        if (sv[0] < 0 || sv[1] < 0) return;
+        request r;
+        request_init(&r, REQ_CHAT, 128);
+        r.api = api ? API_ANTHROPIC : API_OPENAI;
+        r.model_syntax = SERVER_MODEL_SYNTAX_DEEPSEEK41;
+        r.stream = r.has_tools = true;
+        r.think_mode = DS4_THINK_HIGH;
+        openai_stream os;
+        anthropic_stream as;
+        if (api) {
+            TEST_ASSERT(anthropic_sse_start_live(sv[0], &r, "v41_text", 5, &as));
+            TEST_ASSERT(anthropic_sse_stream_update(sv[0], NULL, &r, "v41_text", &as,
+                                                  raw, strlen(raw), false));
+        } else {
+            openai_stream_start(&r, &os);
+            TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "v41_text", &os,
+                                                raw, strlen(raw), false));
+        }
+        shutdown(sv[0], SHUT_WR);
+        char *out = read_socket_text(sv[1]);
+        TEST_ASSERT(strstr(out, "first answer chunk") != NULL);
+        TEST_ASSERT(strstr(out, "</think>") == NULL);
+        free(out);
+        if (api) anthropic_stream_free(&as); else openai_stream_free(&os);
+        request_free(&r);
+        close(sv[0]); close(sv[1]);
+    }
 }
 
 static void test_openai_qwen_tool_stream_sends_answer_before_finish(void) {
@@ -18198,6 +19323,53 @@ static void test_reasoning_effort_mapping(void) {
                                            (int)ds4_think_max_min_context()) == DS4_THINK_MAX);
 }
 
+static void test_deepseek41_reasoning_effort_controls(void) {
+    const struct { const char *name; int level; } cases[] = {
+        {"off", 0}, {"OFF", 0}, {"Off", 0}, {"oFf", 0}, {"NONE", 0},
+        {"low", 50}, {"LOW", 50}, {"Low", 50}, {"lOw", 50},
+        {"high", 75}, {"HIGH", 75}, {"High", 75}, {"hIgH", 75},
+        {"max", 100}, {"MAX", 100}, {"Max", 100}, {"mAx", 100},
+        {"MiNiMaL", 50}, {"MeDiUm", 75}, {"XHIGH", 75},
+        {"1", 1}, {"25", 25}, {"100", 100},
+    };
+    chat_msgs msgs = {0};
+    chat_msg user = {.role = xstrdup("user"), .content = xstrdup("Hello")};
+    chat_msgs_push(&msgs, user);
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        char config[64];
+        snprintf(config, sizeof(config), "{\"effort\":\"%s\"}", cases[i].name);
+        const char *p = config;
+        ds4_think_mode mode = DS4_THINK_HIGH;
+        bool ok = parse_output_config_effort(&p, &mode);
+        TEST_ASSERT(ok && *p == '\0');
+        if (!ok) continue;
+        for (int disabled = 0; disabled <= 1; disabled++) {
+            /* Exercise the shell's separate switch and effort fields together.
+             * Disabled must override every preset, regardless of spelling. */
+            bool enabled = disabled;
+            p = disabled ? "{\"type\":\"DiSaBlEd\"}" : "{\"type\":\"EnAbLeD\"}";
+            TEST_ASSERT(parse_thinking_control_value(&p, &enabled) && *p == '\0');
+            TEST_ASSERT(enabled == !disabled);
+            ds4_think_mode effective = think_mode_from_enabled(enabled, mode);
+            char *prompt = render_chat_prompt_text_for_syntax(
+                SERVER_MODEL_SYNTAX_DEEPSEEK41, &msgs, NULL, NULL, effective);
+            char expected[512];
+            if (!disabled && cases[i].level) {
+                snprintf(expected, sizeof(expected),
+                    "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: %d "
+                    "(range 1-100, the higher the value, the more thorough the reasoning)\n\n"
+                    "<｜User｜>Hello<｜Assistant｜><think>", cases[i].level);
+            } else {
+                snprintf(expected, sizeof(expected),
+                    "<｜begin▁of▁sentence｜><｜User｜>Hello<｜Assistant｜></think>");
+            }
+            TEST_ASSERT(prompt && !strcmp(prompt, expected));
+            free(prompt);
+        }
+    }
+    chat_msgs_free(&msgs);
+}
+
 static void test_model_alias_thinking_controls(void) {
     TEST_ASSERT(model_alias_disables_thinking("deepseek-chat"));
     TEST_ASSERT(model_alias_disables_thinking("glm-5.2-chat"));
@@ -18276,6 +19448,45 @@ static void test_render_think_max_prompt_prefix(void) {
 
     free(prompt);
     chat_msgs_free(&msgs);
+}
+
+static void test_render_blank_reasoning_is_absent(void) {
+    const char *head = "[{\"role\":\"user\",\"content\":\"Hello\"},"
+        "{\"role\":\"assistant\",\"content\":\"\",\"reasoning_content\":";
+    const char *tail = ",\"tool_calls\":[{\"id\":\"c1\",\"type\":\"function\","
+        "\"function\":{\"name\":\"run\",\"arguments\":\"{}\"}}]}]";
+    const char *none_json = "[{\"role\":\"user\",\"content\":\"Hello\"},"
+        "{\"role\":\"assistant\",\"content\":\"\","
+        "\"tool_calls\":[{\"id\":\"c1\",\"type\":\"function\","
+        "\"function\":{\"name\":\"run\",\"arguments\":\"{}\"}}]}]";
+    chat_msgs none = {0};
+    TEST_ASSERT(parse_messages(&none_json, &none));
+    char *expected = render_chat_prompt_text_for_syntax(
+        SERVER_MODEL_SYNTAX_DEEPSEEK41, &none, NULL, NULL, DS4_THINK_LOW);
+    const char *values[] = {"", " ", "\t\n", " \r\n\t", "  actual reasoning  "};
+    for (size_t i = 0; i < sizeof(values) / sizeof(values[0]); i++) {
+        buf json = {0};
+        buf_puts(&json, head); json_escape(&json, values[i]); buf_puts(&json, tail);
+        const char *p = json.ptr;
+        chat_msgs padded = {0};
+        bool ok = parse_messages(&p, &padded);
+        TEST_ASSERT(ok && padded.len == 2);
+        if (ok && padded.len == 2) {
+            char *actual = render_chat_prompt_text_for_syntax(
+                SERVER_MODEL_SYNTAX_DEEPSEEK41, &padded, NULL, NULL, DS4_THINK_LOW);
+            if (i < 4) {
+                TEST_ASSERT(!padded.v[1].reasoning);
+                TEST_ASSERT(actual && expected && !strcmp(actual, expected));
+            } else {
+                TEST_ASSERT(padded.v[1].reasoning &&
+                            !strcmp(padded.v[1].reasoning, values[i]));
+                TEST_ASSERT(actual && strstr(actual, values[i]));
+            }
+            free(actual);
+        }
+        chat_msgs_free(&padded); buf_free(&json);
+    }
+    free(expected); chat_msgs_free(&none);
 }
 
 static void test_render_non_thinking_prompt_closes_think(void) {
@@ -22544,6 +23755,43 @@ static void test_openai_inline_image_content(void) {
     buf_free(&json);
 }
 
+static void test_webp_image_content(void) {
+    const char *data = "UklGRhwAAABXRUJQVlA4TA8AAAAvAUAAAAcQ/Y/+ByKi/wEA";
+    /* The same image must survive all API forms, including a tool result. */
+    for (int api = 0; api < 3; api++) {
+        buf json = {0};
+        chat_msgs msgs = {0};
+        server_image_inputs images = {0};
+        char *content = NULL;
+        if (api == 0) buf_printf(&json,
+            "[{\"role\":\"user\",\"content\":[{\"type\":\"image_url\","
+            "\"image_url\":{\"url\":\"data:image/webp;base64,%s\"}}]}]", data);
+        if (api == 1) buf_printf(&json,
+            "[{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\","
+            "\"tool_use_id\":\"image-call\",\"content\":[{\"type\":\"image\","
+            "\"source\":{\"type\":\"base64\",\"media_type\":\"image/webp\",\"data\":\"%s\"}}]}]}]", data);
+        if (api == 2) buf_printf(&json,
+            "[{\"type\":\"input_image\",\"image_url\":\"data:image/webp;base64,%s\"}]", data);
+        const char *p = json.ptr;
+        bool ok = api == 0 ? parse_messages(&p, &msgs) :
+            api == 1 ? parse_anthropic_messages(&p, &msgs) :
+            parse_responses_content_array_multimodal(&p, &content, &images);
+        TEST_ASSERT(ok);
+        const server_image_inputs *parsed = api == 2 ? &images :
+            msgs.len == 1 ? &msgs.v[0].images : NULL;
+        TEST_ASSERT(parsed && parsed->len == 1);
+        if (parsed && parsed->len == 1) {
+            TEST_ASSERT(parsed->v[0].encoded_len == 36);
+            TEST_ASSERT(!memcmp(parsed->v[0].encoded, "RIFF", 4));
+            TEST_ASSERT(!memcmp(parsed->v[0].encoded + 8, "WEBP", 4));
+        }
+        free(content);
+        server_image_inputs_free(&images);
+        chat_msgs_free(&msgs);
+        buf_free(&json);
+    }
+}
+
 static void test_http_image_paths_and_urls_are_rejected(void) {
     const char *cases[] = {
         "[{\"role\":\"user\",\"content\":[{\"type\":\"image_url\","
@@ -22595,6 +23843,18 @@ static void test_responses_inline_image_content(void) {
     buf_free(&json);
 }
 
+static void test_vision_disk_key(void) {
+    char markers[1][SERVER_IMAGE_MARKER_BYTES] = {"012345678901234567890123456789012345"};
+    ds4_vision_span image = {.embedding = {.fingerprint = {1}}};
+    request req = {.image_count = 1, .image_markers = markers, .images = &image};
+    char text[128]; snprintf(text, sizeof(text), "before%send", markers[0]); req.prompt_text = text;
+    char *a = vision_disk_prompt_key(&req); TEST_ASSERT(a && strlen(a) == strlen(text));
+    memset(markers[0], 'z', strlen(markers[0])); snprintf(text, sizeof(text), "before%send", markers[0]);
+    char *b = vision_disk_prompt_key(&req); TEST_ASSERT(b && !strcmp(a, b)); free(b);
+    image.embedding.fingerprint[0] = 2;
+    b = vision_disk_prompt_key(&req); TEST_ASSERT(b && strcmp(a, b)); free(b); free(a);
+}
+
 static void test_visible_image_key(void) {
     char markers[2][SERVER_IMAGE_MARKER_BYTES] = {"nonce_A", "nonce_B"};
     request req = {.image_count = 1, .image_markers = markers};
@@ -22605,20 +23865,20 @@ static void test_visible_image_key(void) {
     char *b = visible_prompt_key(&req, "xnonce_Zy", &next);
     TEST_ASSERT(a && b && !strcmp(a, b));
     TEST_ASSERT(visible_image_prefix_matches(&next, &first, strlen(a)));
-    free(b);
+    free(b); visible_image_key_free(&next);
     req.image_count = 0;
     b = visible_prompt_key(&req, a, &next);
     TEST_ASSERT(b && !strcmp(a, b));
     TEST_ASSERT(!visible_image_prefix_matches(&next, &first, strlen(a)));
-    free(b);
+    free(b); visible_image_key_free(&next);
     req.image_count = 2;
     b = visible_prompt_key(&req, "xnonce_Zy-nextnonce_B", &next);
     TEST_ASSERT(b && byte_prefix_match(b, strlen(b), a, strlen(a)));
     TEST_ASSERT(visible_image_prefix_matches(&next, &first, strlen(a)));
     next.offsets[0]++;
     TEST_ASSERT(!visible_image_prefix_matches(&next, &first, strlen(a)));
-    free(b);
-    free(a);
+    free(b); visible_image_key_free(&next);
+    free(a); visible_image_key_free(&first);
     TEST_ASSERT(visible_prompt_key(&req, "marker missing", &next) == NULL);
 
     request glm = {.model_syntax = SERVER_MODEL_SYNTAX_GLM, .think_mode = DS4_THINK_HIGH,
@@ -22626,6 +23886,38 @@ static void test_visible_image_key(void) {
     char *visible = build_thinking_visible_text(&glm, " hello ");
     TEST_ASSERT(!strcmp(visible, "<|user|>hello<|assistant|><think></think>hello"));
     free(visible);
+}
+
+static void test_many_visible_image_keys(void) {
+    const size_t count = 6144;
+    request req = {.image_count = count};
+    req.image_markers = xmalloc(count * sizeof(*req.image_markers));
+    req.images = calloc(count, sizeof(*req.images));
+    TEST_ASSERT(req.images != NULL);
+    if (!req.images) { free(req.image_markers); return; }
+    buf text = {0};
+    for (size_t i = 0; i < count; i++) {
+        snprintf(req.image_markers[i], sizeof(req.image_markers[i]),
+                 "image-marker-%040zu", i);
+        buf_puts(&text, "text");
+        buf_puts(&text, req.image_markers[i]);
+        memcpy(req.images[i].embedding.fingerprint, &i, sizeof(i));
+    }
+    req.prompt_text = text.ptr;
+    visible_image_key first, next;
+    char *a = visible_prompt_key(&req, text.ptr, &first);
+    char *b = visible_prompt_key(&req, text.ptr, &next);
+    TEST_ASSERT(a && b && first.count == count && next.count == count);
+    TEST_ASSERT(visible_image_prefix_matches(&next, &first, strlen(a)));
+    next.offsets[4097]++;
+    TEST_ASSERT(!visible_image_prefix_matches(&next, &first, strlen(a)));
+    char *disk_a = vision_disk_prompt_key(&req);
+    req.images[5000].embedding.fingerprint[0] ^= 1;
+    char *disk_b = vision_disk_prompt_key(&req);
+    TEST_ASSERT(disk_a && disk_b && strcmp(disk_a, disk_b));
+    visible_image_key_free(&first); visible_image_key_free(&next);
+    free(a); free(b); free(disk_a); free(disk_b);
+    free(req.images); free(req.image_markers); buf_free(&text);
 }
 
 static void test_anthropic_tool_image_output(void) {
@@ -22685,13 +23977,13 @@ static void test_responses_tool_image_output(void) {
 
 static void test_server_image_embedding_cache(void) {
     server_image_cache cache = {0};
-    uint8_t key = 1;
+    uint32_t key = 1;
     float data[2] = {1.25f, -2.5f};
-    server_image_input input = {.encoded = &key, .encoded_len = 1};
+    server_image_input input = {.encoded = (uint8_t *)&key, .encoded_len = sizeof(key)};
     ds4_vision_embedding src = {.data = data, .token_count = 1,
                                .width = 42, .fingerprint = {7}};
     ds4_vision_embedding out = {0};
-    const size_t budget = 2 * (sizeof(data) + 1);
+    const size_t budget = 2 * (sizeof(data) + sizeof(key));
     TEST_ASSERT(!server_image_cache_get(&cache, &input, &out));
     server_image_cache_put(&cache, &input, &src, 2, budget);
     TEST_ASSERT(server_image_cache_get(&cache, &input, &out));
@@ -22717,8 +24009,8 @@ static void test_server_image_embedding_cache(void) {
     server_image_cache_clear(&cache);
     TEST_ASSERT(cache.bytes == 0 && cache.clock == 0);
     for (key = 1; key <= SERVER_IMAGE_CACHE_ENTRIES + 1; key++)
-        server_image_cache_put(&cache, &input, &src, 2, 4096);
-    TEST_ASSERT(cache.bytes == SERVER_IMAGE_CACHE_ENTRIES * (sizeof(data) + 1));
+        server_image_cache_put(&cache, &input, &src, 2, (SERVER_IMAGE_CACHE_ENTRIES + 1) * (sizeof(data) + sizeof(key)));
+    TEST_ASSERT(cache.bytes == SERVER_IMAGE_CACHE_ENTRIES * (sizeof(data) + sizeof(key)));
     key = 1;
     TEST_ASSERT(!server_image_cache_get(&cache, &input, &out));
     server_image_cache_clear(&cache);
@@ -22743,6 +24035,126 @@ static void test_server_image_embedding_cache(void) {
         ds4_vision_embedding_free(&out);
     }
     server_image_cache_clear(&cache);
+}
+
+static void test_server_image_disk_cache(void) {
+    char dir[] = "/tmp/ds4-image-cache-XXXXXX";
+    TEST_ASSERT(mkdtemp(dir) != NULL);
+    char *model = path_join(dir, "encoder.gguf");
+    FILE *fp = fopen(model, "wb");
+    TEST_ASSERT(fp != NULL);
+    if (!fp) { free(model); return; }
+    TEST_ASSERT(fwrite("model A", 1, 7, fp) == 7);
+    TEST_ASSERT(fclose(fp) == 0);
+    server_image_cache cache = {0};
+    server_image_disk_open(&cache, dir, model, DS4_BACKEND_CUDA, 41, 5120);
+    TEST_ASSERT(cache.disk_dir != NULL);
+    if (!cache.disk_dir) { unlink(model); free(model); rmdir(dir); return; }
+    float data[2 * 5120];
+    for (size_t i = 0; i < sizeof(data) / sizeof(*data); i++) data[i] = (float)i / 16;
+    data[0] = -0.0f;
+    uint8_t key[] = {1, 2, 3};
+    server_image_input input = {.encoded = key, .encoded_len = sizeof(key)};
+    ds4_vision_embedding src = {.data = data, .token_count = 2, .layout = 1,
+        .grid_width = 2, .grid_height = 1, .width = 84, .height = 42,
+        .content_width = 80, .content_height = 40, .fingerprint = {7, 9}};
+    char *path = server_image_disk_path(&cache, &input);
+    TEST_ASSERT(server_image_disk_put(&cache, path, &input, &src, 5120));
+
+    /* A fresh cache instance models a process restart; no RAM entries survive. */
+    server_image_cache reopened = {0};
+    server_image_disk_open(&reopened, dir, model, DS4_BACKEND_CUDA, 41, 5120);
+    TEST_ASSERT(!strcmp(cache.model_key, reopened.model_key));
+    ds4_vision_embedding out = {0};
+    TEST_ASSERT(server_image_disk_get(&reopened, path, &input, 5120, &out));
+    if (out.data) {
+        TEST_ASSERT(!memcmp(data, out.data, sizeof(data)));
+        TEST_ASSERT(out.token_count == src.token_count && out.layout == src.layout &&
+                    out.grid_width == src.grid_width && out.grid_height == src.grid_height &&
+                    out.width == src.width && out.height == src.height &&
+                    out.content_width == src.content_width && out.content_height == src.content_height &&
+                    !memcmp(out.fingerprint, src.fingerprint, sizeof(src.fingerprint)));
+    }
+    ds4_vision_embedding_free(&out);
+    free(reopened.disk_dir);
+
+    /* A flipped embedding bit and truncated write must never become a hit. */
+    fp = fopen(path, "r+b");
+    TEST_ASSERT(fp != NULL);
+    if (fp) {
+        TEST_ASSERT(fseek(fp, (long)(sizeof(server_image_disk_header) + sizeof(key)), SEEK_SET) == 0);
+        TEST_ASSERT(fputc(1, fp) != EOF);
+        TEST_ASSERT(fclose(fp) == 0);
+    }
+    TEST_ASSERT(!server_image_disk_get(&cache, path, &input, 5120, &out));
+    TEST_ASSERT(out.data == NULL);
+    TEST_ASSERT(server_image_disk_put(&cache, path, &input, &src, 5120));
+    TEST_ASSERT(truncate(path, sizeof(server_image_disk_header) + sizeof(key)) == 0);
+    TEST_ASSERT(!server_image_disk_get(&cache, path, &input, 5120, &out));
+    TEST_ASSERT(server_image_disk_put(&cache, path, &input, &src, 5120));
+    TEST_ASSERT(!server_image_disk_get(&cache, path, &input, 4096, &out));
+    TEST_ASSERT(server_image_disk_put(&cache, path, &input, &src, 5120));
+    key[2] = 4;
+    TEST_ASSERT(!server_image_disk_get(&cache, path, &input, 5120, &out));
+    key[2] = 3;
+    TEST_ASSERT(server_image_disk_put(&cache, path, &input, &src, 5120));
+    char saved = cache.model_key[0];
+    cache.model_key[0] = saved == 'a' ? 'b' : 'a';
+    TEST_ASSERT(!server_image_disk_get(&cache, path, &input, 5120, &out));
+    cache.model_key[0] = saved;
+
+    /* Hash the complete encoder, not its name/size: same-size replacement misses. */
+    fp = fopen(model, "wb");
+    TEST_ASSERT(fp != NULL);
+    if (fp) { TEST_ASSERT(fwrite("model B", 1, 7, fp) == 7); fclose(fp); }
+    server_image_cache changed = {0};
+    server_image_disk_open(&changed, dir, model, DS4_BACKEND_CUDA, 41, 5120);
+    TEST_ASSERT(strcmp(cache.model_key, changed.model_key) != 0);
+    char changed_key[41];
+    memcpy(changed_key, changed.model_key, sizeof(changed_key));
+    free(changed.disk_dir);
+    changed = (server_image_cache){0};
+    server_image_disk_open(&changed, dir, model, DS4_BACKEND_CPU, 41, 5120);
+    TEST_ASSERT(strcmp(changed_key, changed.model_key) != 0);
+    free(changed.disk_dir);
+
+    /* A disk hit refreshes LRU; capacity eviction preserves the recently read image. */
+    const uint64_t entry_bytes = sizeof(server_image_disk_header) + sizeof(key) + sizeof(data) + 40;
+    cache.disk_budget = 2 * entry_bytes;
+    TEST_ASSERT(server_image_disk_put(&cache, path, &input, &src, 5120));
+    struct timespec old[2] = {{100, 0}, {100, 0}};
+    TEST_ASSERT(utimensat(AT_FDCWD, path, old, 0) == 0);
+    key[0] = 2;
+    char *second = server_image_disk_path(&cache, &input);
+    TEST_ASSERT(server_image_disk_put(&cache, second, &input, &src, 5120));
+    old[0].tv_sec = old[1].tv_sec = 200;
+    TEST_ASSERT(utimensat(AT_FDCWD, second, old, 0) == 0);
+    key[0] = 1;
+    TEST_ASSERT(server_image_disk_get(&cache, path, &input, 5120, &out));
+    ds4_vision_embedding_free(&out);
+    key[0] = 3;
+    char *third = server_image_disk_path(&cache, &input);
+    TEST_ASSERT(server_image_disk_put(&cache, third, &input, &src, 5120));
+    TEST_ASSERT(access(path, F_OK) == 0 && access(second, F_OK) != 0);
+    TEST_ASSERT(access(third, F_OK) == 0);
+    cache.disk_budget = entry_bytes - 1;
+    TEST_ASSERT(!server_image_disk_put(&cache, third, &input, &src, 5120));
+    TEST_ASSERT(access(path, F_OK) == 0 && access(third, F_OK) == 0);
+    char *orphan = xmalloc(strlen(path) + 12);
+    sprintf(orphan, "%s.tmp.orphan", path);
+    fp = fopen(orphan, "wb");
+    TEST_ASSERT(fp != NULL);
+    if (fp) fclose(fp);
+    TEST_ASSERT(utimensat(AT_FDCWD, orphan, old, 0) == 0);
+    cache.disk_budget = 2 * entry_bytes;
+    TEST_ASSERT(server_image_disk_trim(&cache, 0));
+    TEST_ASSERT(access(orphan, F_OK) != 0);
+    free(orphan);
+    unlink(path); unlink(second); unlink(third);
+    rmdir(cache.disk_dir);
+    free(cache.disk_dir);
+    free(path); free(second); free(third);
+    unlink(model); free(model); rmdir(dir);
 }
 
 static void test_deepseek41_server_stream(void) {
@@ -22917,15 +24329,303 @@ static void test_deepseek41_live_result_order(void) {
     pthread_mutex_destroy(&s.tool_mu);
 }
 
+typedef struct {
+    int fd;
+    const char *data;
+    size_t len, fragment;
+} http_test_write;
+
+static void *http_test_writer(void *opaque) {
+    http_test_write *w = opaque;
+    for (size_t pos = 0; pos < w->len;) {
+        size_t count = w->len - pos;
+        if (count > w->fragment) count = w->fragment;
+        if (!send_all(w->fd, w->data + pos, count)) break;
+        pos += count;
+    }
+    shutdown(w->fd, SHUT_WR);
+    return NULL;
+}
+
+static void test_http_wire(const char *wire, size_t wire_len, size_t fragment,
+                           const char *body, size_t body_len, bool accepted) {
+    int sv[2];
+    int rc = socketpair(AF_UNIX, SOCK_STREAM, 0, sv);
+    TEST_ASSERT(rc == 0);
+    if (rc) return;
+    struct timeval timeout = {.tv_sec = 1};
+    setsockopt(sv[0], SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+    setsockopt(sv[1], SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    http_test_write writer = {sv[0], wire, wire_len, fragment};
+    pthread_t thread;
+    rc = pthread_create(&thread, NULL, http_test_writer, &writer);
+    TEST_ASSERT(rc == 0);
+    if (rc) { close(sv[0]); close(sv[1]); return; }
+    http_request req = {0};
+    bool ok = read_http_request(sv[1], &req);
+    TEST_ASSERT(ok == accepted);
+    if (ok) {
+        TEST_ASSERT(!strcmp(req.method, "POST"));
+        TEST_ASSERT(!strcmp(req.path, "/v1/chat/completions"));
+        TEST_ASSERT(req.body_len == body_len);
+        TEST_ASSERT(req.body && req.body[req.body_len] == '\0');
+        if (req.body_len == body_len && body_len)
+            TEST_ASSERT(!memcmp(req.body, body, body_len));
+    } else {
+        TEST_ASSERT(req.body == NULL && req.body_len == 0);
+    }
+    pthread_join(thread, NULL);
+    http_request_free(&req);
+    close(sv[0]); close(sv[1]);
+}
+
+static void test_http_request_framing(void) {
+    const char *head = "POST /v1/chat/completions?probe=1 HTTP/1.1\r\nHost: localhost\r\n";
+    char payload[65537];
+    for (size_t i = 0; i < sizeof(payload); i++) payload[i] = (char)(i % 251);
+    buf wire = {0};
+    buf_puts(&wire, head);
+    buf_printf(&wire, "Content-Length: %zu\r\n\r\n", sizeof(payload));
+    buf_append(&wire, payload, sizeof(payload));
+    test_http_wire(wire.ptr, wire.len, 7, payload, sizeof(payload), true);
+    buf_free(&wire);
+
+    buf_puts(&wire, head);
+    buf_puts(&wire, "Transfer-Encoding: ChUnKeD\r\n\r\n");
+    for (size_t pos = 0; pos < sizeof(payload);) {
+        size_t count = sizeof(payload) - pos;
+        if (count > 4093) count = 4093;
+        buf_printf(&wire, "%zX;ignored=\"a;b\"\r\n", count);
+        buf_append(&wire, payload + pos, count);
+        buf_puts(&wire, "\r\n");
+        pos += count;
+    }
+    buf_puts(&wire, "0\r\nX-Diagnostic: complete\r\n\r\n");
+    test_http_wire(wire.ptr, wire.len, 1, payload, sizeof(payload), true);
+    test_http_wire(wire.ptr, wire.len, 8192, payload, sizeof(payload), true);
+    buf_free(&wire);
+
+    const struct { const char *suffix; const char *body; bool ok; } cases[] = {
+        {"\r\n", "", true},
+        {"Content-Length: 0\r\n\r\n", "", true},
+        {"Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n", "", true},
+        {"Transfer-Encoding: chunked\r\n\r\n2\r\n{}\r\n0\r\n\r\n", "{}", true},
+        {"Transfer-Encoding: chunked\r\nContent-Length: 2\r\n\r\n", NULL, false},
+        {"Content-Length: 2\r\nContent-Length: 2\r\n\r\n{}", NULL, false},
+        {"Content-Length: -1\r\n\r\n", NULL, false},
+        {"Content-Length: 2junk\r\n\r\n{}", NULL, false},
+        {"Content-Length: 1073741825\r\n\r\n", NULL, false},
+        {"Content-Length: 999999999999999999999\r\n\r\n", NULL, false},
+        {"Content-Length : 2\r\n\r\n{}", NULL, false},
+        {"Content-Length: 3\r\n\r\n{}", NULL, false},
+        {"Transfer-Encoding: gzip, chunked\r\n\r\n", NULL, false},
+        {"Transfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n", NULL, false},
+        {"Transfer-Encoding: chunked\r\n\r\ng\r\n", NULL, false},
+        {"Transfer-Encoding: chunked\r\n\r\n-1\r\n", NULL, false},
+        {"Transfer-Encoding: chunked\r\n\r\n40000001\r\n", NULL, false},
+        {"Transfer-Encoding: chunked\r\n\r\nffffffffffffffffffffffff\r\n", NULL, false},
+        {"Transfer-Encoding: chunked\r\n\r\n3\r\n{}", NULL, false},
+        {"Transfer-Encoding: chunked\r\n\r\n2\r\n{}XX0\r\n\r\n", NULL, false},
+        {"Transfer-Encoding: chunked\r\n\r\n0\r\n", NULL, false},
+        {"Transfer-Encoding: chunked\r\n\r\n0\r\nContent-Length: 2\r\n\r\n", NULL, false},
+        {"Transfer-Encoding: chunked\r\n\r\n0\r\ninvalid trailer\r\n\r\n", NULL, false},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        buf_puts(&wire, head); buf_puts(&wire, cases[i].suffix);
+        test_http_wire(wire.ptr, wire.len, 8192, cases[i].body,
+                       cases[i].body ? strlen(cases[i].body) : 0, cases[i].ok);
+        buf_free(&wire);
+    }
+    /* Bound chunk-size lines and trailer sections without allocating a body. */
+    buf_puts(&wire, head); buf_puts(&wire, "Transfer-Encoding: chunked\r\n\r\n1;");
+    for (int i = 0; i < 8192; i++) buf_putc(&wire, 'x');
+    buf_puts(&wire, "\r\na\r\n0\r\n\r\n");
+    test_http_wire(wire.ptr, wire.len, 8192, NULL, 0, false); buf_free(&wire);
+    buf_puts(&wire, head); buf_puts(&wire, "Transfer-Encoding: chunked\r\n\r\n0\r\n");
+    for (int i = 0; i < 9; i++) {
+        buf_puts(&wire, "X: ");
+        for (int j = 0; j < 8000; j++) buf_putc(&wire, 'x');
+        buf_puts(&wire, "\r\n");
+    }
+    buf_puts(&wire, "\r\n");
+    test_http_wire(wire.ptr, wire.len, 8192, NULL, 0, false); buf_free(&wire);
+}
+
+static void test_image_files(void) {
+    char tmp[] = "/tmp/ds4-files-test-XXXXXX";
+    TEST_ASSERT(mkdtemp(tmp) != NULL);
+    char *saved_dir = server_files_dir; server_files_dir = NULL;
+    TEST_ASSERT(server_files_open(tmp));
+    uint8_t *png = NULL; size_t png_len = 0;
+    TEST_ASSERT(server_decode_base64(test_inline_png_base64, &png, &png_len));
+    server_file_record rec = {0};
+    memcpy(rec.magic, "DS4FIL1", 8); rec.bytes = png_len; rec.created_at = 123;
+    strcpy(rec.filename, "a;\"b.png"); strcpy(rec.mime, "image/png"); strcpy(rec.purpose, "vision");
+    char id[38];
+    TEST_ASSERT(server_file_store(png, png_len, &rec, id));
+    TEST_ASSERT(server_file_id_valid(id));
+    TEST_ASSERT(!server_file_id_valid("file-../../etc/passwd"));
+    server_file_record loaded; uint8_t *bytes = NULL;
+    TEST_ASSERT(server_file_read(id, &loaded, &bytes));
+    TEST_ASSERT(loaded.bytes == png_len && !memcmp(bytes, png, png_len)); free(bytes);
+    /* Closing/reopening storage must preserve references, with no RAM registry. */
+    free(server_files_dir); server_files_dir = NULL;
+    TEST_ASSERT(server_files_open(tmp));
+    const char *formats[] = {
+        "{\"type\":\"input_image\",\"file_id\":\"%s\"}",
+        "{\"type\":\"image_url\",\"image_url\":{\"url\":\"%s\"}}",
+        "{\"type\":\"file\",\"file\":{\"file_id\":\"%s\"}}",
+        "{\"type\":\"image_file\",\"image_file\":{\"file_id\":\"%s\"}}"
+    };
+    for (size_t i = 0; i < sizeof(formats)/sizeof(formats[0]); i++) {
+        char json[256]; snprintf(json, sizeof(json), formats[i], id);
+        const char *p = json; chat_msg msg = {0};
+        TEST_ASSERT(parse_openai_content_object(&p, &msg));
+        TEST_ASSERT(msg.images.len == 1);
+        if (msg.images.len) TEST_ASSERT(msg.images.v[0].encoded_len == png_len && !memcmp(msg.images.v[0].encoded, png, png_len));
+        chat_msg_free(&msg);
+    }
+    char json[512];
+    snprintf(json, sizeof(json), "[{\"type\":\"input_image\",\"file_id\":\"%s\"}]", id);
+    const char *p = json; char *text = NULL; server_image_inputs images = {0};
+    TEST_ASSERT(parse_responses_content_array(&p, &text, &images));
+    TEST_ASSERT(images.len == 1); free(text); server_image_inputs_free(&images);
+    snprintf(json, sizeof(json), "{\"type\":\"image\",\"source\":{\"type\":\"file\",\"file_id\":\"%s\"}}", id);
+    p = json; chat_msg msg = {0};
+    TEST_ASSERT(parse_anthropic_content_block(&p, false, &msg));
+    TEST_ASSERT(msg.images.len == 1); chat_msg_free(&msg);
+    snprintf(json, sizeof(json), "{\"type\":\"input_image\",\"file_id\":\"%s\",\"image_url\":\"%s\"}", id, id);
+    p = json; TEST_ASSERT(!parse_openai_content_object(&p, &msg)); chat_msg_free(&msg);
+    buf wire = {0};
+    buf_puts(&wire, "--test\r\nContent-Disposition: form-data; name=\"expires_after[anchor]\"\r\n\r\ncreated_at\r\n");
+    buf_puts(&wire, "--test\r\nContent-Disposition: form-data; name=\"expires_after[seconds]\"\r\n\r\n86400\r\n");
+    buf_puts(&wire, "--test\r\nContent-Disposition: form-data; name=\"future_metadata\"\r\n\r\nignored\r\n");
+    buf_puts(&wire, "--test\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a;\\\"b.png\"\r\nContent-Type: image/png\r\n\r\n");
+    buf_append(&wire, png, png_len);
+    buf_puts(&wire, "\r\n--testXbinary\0"); /* prefix is not a delimiter */
+    buf_puts(&wire, "\r\n--test\r\nContent-Disposition: form-data; name=\"purpose\"\r\n\r\nvision\r\n--test--\r\n");
+    http_request req = {0}; strcpy(req.content_type, "multipart/form-data; boundary=\"test\"");
+    req.body = wire.ptr; req.body_len = wire.len; file_upload u = {0};
+    TEST_ASSERT(file_multipart(&req, &u));
+    TEST_ASSERT(!strcmp(u.record.filename, "a;\"b.png") && u.len > png_len);
+    /* Exercise upload validation itself, including the decoder's boolean result. */
+    int pair[2]; TEST_ASSERT(!socketpair(AF_UNIX, SOCK_STREAM, 0, pair));
+    strcpy(req.method, "POST"); strcpy(req.path, "/v1/files");
+    server_files_http(pair[0], false, &req);
+    shutdown(pair[0], SHUT_WR);
+    char response[2048]; ssize_t got = recv(pair[1], response, sizeof(response)-1, 0);
+    TEST_ASSERT(got > 0);
+    if (got > 0) { response[got] = 0; TEST_ASSERT(strstr(response, "200 OK") != NULL); }
+    close(pair[0]); close(pair[1]);
+    /* Valid magic with an invalid payload must not be persisted. */
+    char *payload = strstr(wire.ptr, "Content-Type: image/png\r\n\r\n");
+    if (payload) { payload += strlen("Content-Type: image/png\r\n\r\n"); memset(payload + 8, 0, png_len - 8); }
+    TEST_ASSERT(!socketpair(AF_UNIX, SOCK_STREAM, 0, pair));
+    server_files_http(pair[0], false, &req); shutdown(pair[0], SHUT_WR);
+    got = recv(pair[1], response, sizeof(response)-1, 0);
+    TEST_ASSERT(got > 0);
+    if (got > 0) { response[got] = 0; TEST_ASSERT(strstr(response, "400 Bad Request") != NULL); }
+    close(pair[0]); close(pair[1]);
+    req.body_len -= 5; memset(&u, 0, sizeof(u)); TEST_ASSERT(!file_multipart(&req, &u));
+    buf_free(&wire);
+    char value[64];
+    TEST_ASSERT(!file_parameter("form-data; name=file; name=file", "name", value, sizeof(value)));
+    TEST_ASSERT(!file_parameter("form-data; name=\"unterminated", "name", value, sizeof(value)));
+    char *path = server_file_path(id); TEST_ASSERT(!unlink(path)); free(path);
+    char marker[SERVER_IMAGE_MARKER_BYTES];
+    TEST_ASSERT(!server_image_inputs_push_file(&images, id, marker));
+    TEST_ASSERT(server_file_error[0]);
+    TEST_ASSERT(!strcmp(server_missing_file_id, id));
+    TEST_ASSERT(!socketpair(AF_UNIX, SOCK_STREAM, 0, pair));
+    TEST_ASSERT(http_error_file_not_found(pair[0], false, server_missing_file_id));
+    shutdown(pair[0], SHUT_WR);
+    got = recv(pair[1], response, sizeof(response)-1, 0);
+    TEST_ASSERT(got > 0);
+    if (got > 0) {
+        response[got] = 0;
+        buf expected = {0};
+        buf_printf(&expected, "{\"error\":{\"type\":\"invalid_request_error\",\"code\":\"file_not_found\",\"param\":\"%s\",\"message\":\"file %s not found\"}}", id, id);
+        TEST_ASSERT(strstr(response, "400 Bad Request") && strstr(response, expected.ptr));
+        buf_free(&expected);
+    }
+    close(pair[0]); close(pair[1]);
+    server_file_error[0] = 0; server_missing_file_id[0] = 0;
+    DIR *cleanup = opendir(tmp); struct dirent *e;
+    if (cleanup) { while ((e = readdir(cleanup))) { char *f = server_file_path(e->d_name); if (f) { unlink(f); free(f); } } closedir(cleanup); }
+    /* Scale quota/batch down while exercising the actual 64/8-GiB algorithm. */
+    char ids[4][38];
+    for (int i = 0; i < 4; i++) {
+        TEST_ASSERT(server_file_store(png, png_len, &rec, ids[i]));
+        char *f = server_file_path(ids[i]);
+        struct timespec times[2] = {{100+i, 0}, {100+i, 0}};
+        TEST_ASSERT(!utimensat(AT_FDCWD, f, times, 0)); free(f);
+    }
+    bytes = NULL; TEST_ASSERT(server_file_read(ids[0], &loaded, &bytes)); free(bytes);
+    free(server_files_dir); server_files_dir = NULL; TEST_ASSERT(server_files_open(tmp));
+    TEST_ASSERT(server_files_make_room(png_len, png_len * 4, png_len * 2));
+    TEST_ASSERT(server_file_read(ids[0], &loaded, NULL)); /* refreshed oldest survives */
+    TEST_ASSERT(!server_file_read(ids[1], &loaded, NULL));
+    TEST_ASSERT(!server_file_read(ids[2], &loaded, NULL));
+    TEST_ASSERT(server_file_read(ids[3], &loaded, NULL));
+    for (int i = 0; i < 4; i++) { char *f = server_file_path(ids[i]); unlink(f); free(f); }
+    free(png); free(server_files_dir); server_files_dir = saved_dir; rmdir(tmp);
+}
+
+static void test_http_api_key(void) {
+    const char *saved = server_api_key;
+    server_api_key = "test-key-0123456789abcdef";
+    const struct { const char *fields; bool ok; } cases[] = {
+        {"", false},
+        {"Authorization: Bearer test-key-0123456789abcdef\r\n", true},
+        {"authorization: bEaReR\ttest-key-0123456789abcdef  \r\n", true},
+        {"X-API-Key: test-key-0123456789abcdef\r\n", true},
+        {"Authorization: Bearer test-key-0123456789abcdeg\r\n", false},
+        {"Authorization: Bearer test-key-0123456789abcde\r\n", false},
+        {"Authorization: Bearer TEST-key-0123456789abcdef\r\n", false},
+        {"Authorization: Basic test-key-0123456789abcdef\r\n", false},
+        {"Authorization: Bearer\r\n", false},
+        {"Authorization: Bearer test-key-0123456789abcdef\r\nAuthorization: Bearer test-key-0123456789abcdef\r\n", false},
+        {"x-api-key: test-key-0123456789abcdef\r\nx-api-key: test-key-0123456789abcdef\r\n", false},
+        {"Authorization: Bearer test-key-0123456789abcdef\r\nx-api-key: wrong\r\n", false},
+        {"Authorization: Bearer test-key-0123456789abcdef\r\nx-api-key: test-key-0123456789abcdef\r\n", true},
+        {"X-Other: Bearer test-key-0123456789abcdef\r\n", false},
+    };
+    for (size_t i = 0; i < sizeof(cases)/sizeof(cases[0]); i++) {
+        buf h = {0}; buf_puts(&h, "POST /v1/files HTTP/1.1\r\n");
+        buf_puts(&h, cases[i].fields); buf_puts(&h, "\r\n");
+        TEST_ASSERT(http_authorized(h.ptr, h.len) == cases[i].ok);
+        buf_free(&h);
+    }
+    /* Rejection must not wait for a large unauthenticated request body. */
+    int pair[2]; TEST_ASSERT(!socketpair(AF_UNIX, SOCK_STREAM, 0, pair));
+    struct timeval timeout = {.tv_sec = 1};
+    setsockopt(pair[1], SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    const char *h = "POST /v1/files HTTP/1.1\r\nContent-Length: 1000000\r\n\r\n";
+    TEST_ASSERT(send_all(pair[0], h, strlen(h)));
+    http_request req = {0};
+    TEST_ASSERT(read_http_request(pair[1], &req));
+    TEST_ASSERT(req.unauthorized && !req.body && !req.body_len);
+    http_request_free(&req); close(pair[0]); close(pair[1]);
+    test_http_wire("POST /v1/chat/completions HTTP/1.1\r\nAuthorization: Bearer test-key-0123456789abcdef\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n{}\r\n0\r\n\r\n",
+        strlen("POST /v1/chat/completions HTTP/1.1\r\nAuthorization: Bearer test-key-0123456789abcdef\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n{}\r\n0\r\n\r\n"), 3, "{}", 2, true);
+    server_api_key = saved;
+}
+
 static void ds4_server_unit_tests_run(void) {
+    test_http_api_key();
+    test_image_files();
+    test_http_request_framing();
     test_deepseek41_server_stream();
     test_deepseek41_server_tools();
     test_deepseek41_anthropic_results();
     test_deepseek41_live_result_order();
     test_visible_image_key();
+    test_many_visible_image_keys();
+    test_vision_disk_key();
     test_anthropic_tool_image_output();
     test_responses_tool_image_output();
     test_server_image_embedding_cache();
+    test_server_image_disk_cache();
     test_batched_prefill_round_robin();
     test_mixed_prefill_quantum_option();
     test_multimodal_prefill_resume_frontier();
@@ -22939,10 +24639,12 @@ static void ds4_server_unit_tests_run(void) {
     test_request_defaults_use_min_p_filtering();
     test_chat_ignore_eos_contract();
     test_reasoning_effort_mapping();
+    test_deepseek41_reasoning_effort_controls();
     test_model_alias_thinking_controls();
     test_api_thinking_controls_parse();
     test_render_think_max_prompt_prefix();
     test_render_non_thinking_prompt_closes_think();
+    test_render_blank_reasoning_is_absent();
     test_render_drops_old_reasoning_without_tools();
     test_render_preserves_reasoning_with_tools();
     test_render_chat_prompt_text_renders_tools_before_system();
@@ -22987,6 +24689,7 @@ static void ds4_server_unit_tests_run(void) {
     test_anthropic_tool_stream_sends_live_tool_use();
     test_openai_tool_stream_sends_incremental_text();
     test_openai_stream_reroutes_second_reasoning_pass();
+    test_deepseek41_text_stream_before_finish();
     test_openai_qwen_tool_stream_sends_answer_before_finish();
     test_qwen_stream_split_reasoning_close();
     test_openai_stream_usage_reports_cache_details();
@@ -23041,6 +24744,7 @@ static void ds4_server_unit_tests_run(void) {
     test_thinking_canonical_with_tools_preserves_reasoning();
     test_thinking_canonical_non_thinking_mode_noop();
     test_openai_inline_image_content();
+    test_webp_image_content();
     test_http_image_paths_and_urls_are_rejected();
     test_anthropic_inline_image_content();
     test_responses_inline_image_content();

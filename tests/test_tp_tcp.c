@@ -157,7 +157,207 @@ static void check_exchange(bool tcp, bool nonblocking) {
            tcp ? "TCP" : "Unix", nonblocking);
 }
 
-int main(void) {
+
+typedef struct { ds4_tp tp; FILE *fp; uint64_t bytes; int ok; } payload_peer;
+static void *send_snapshot(void *arg) {
+    payload_peer *p = arg;
+    p->ok = tp_payload_transfer(&p->tp, p->fp, p->bytes, true);
+    const uint32_t sentinel = 0x12345678;
+    if (p->ok) p->ok = tp_write_full(p->tp.control_fd, &sentinel, sizeof(sentinel));
+    return NULL;
+}
+static void check_payload_staging(bool disk_full) {
+    int fd[2]; pair(fd, true);
+    const size_t bytes = 3u * 1024u * 1024u + 37u;
+    unsigned char *data = malloc(bytes); assert(data); pattern(data, bytes, 7);
+    FILE *src = tmpfile(), *dst = disk_full ? fopen("/dev/full", "wb") : tmpfile();
+    assert(src && dst && fwrite(data, 1, bytes, src) == bytes); rewind(src);
+    payload_peer tx = {.tp = {.control_fd = fd[0]}, .fp = src, .bytes = bytes};
+    ds4_tp rx = {.control_fd = fd[1]}; pthread_t thread;
+    assert(!pthread_create(&thread, NULL, send_snapshot, &tx));
+    assert(tp_payload_transfer(&rx, dst, bytes, false) == !disk_full);
+    uint32_t sentinel = 0;
+    assert(tp_read_full(fd[1], &sentinel, sizeof(sentinel)) && sentinel == 0x12345678);
+    assert(!pthread_join(thread, NULL) && tx.ok);
+    if (!disk_full) { rewind(dst); assert(fread(data, 1, bytes, dst) == bytes); check_pattern(data, bytes, 7); }
+    fclose(src); fclose(dst); free(data); close(fd[0]); close(fd[1]);
+    puts(disk_full ? "Snapshot disk-full drain preserves framing: PASS" : "Multi-chunk snapshot bytes: PASS");
+}
+
+#ifdef __linux__
+#include <sys/wait.h>
+
+/* Exercise actual cross-process mapping, slot reuse, negotiation fallback,
+ * one-sided import failure, and a peer disappearing inside a gate. */
+static void check_local_processes(int mode) {
+    int data[2], control[2];
+    pair(data, false); pair(control, false);
+    const pid_t pid = fork();
+    assert(pid >= 0);
+    const int rank = pid == 0;
+    close(data[1-rank]); close(control[1-rank]);
+    ds4_tp tp = {.rank = rank, .data_fd = data[rank], .control_fd = control[rank],
+        .n_layer = 2, .n_slots = 4, .local_capable = true, .gate_timeout_ms = 100};
+    unsigned char handle[64], peer_handle[64];
+    pattern(handle, sizeof(handle), rank);
+    const int expected = mode == 1 || mode == 4 ? 0 : 1;
+    if (mode == 4) setenv("DS4_CUDA_TP_IPC", "0", 1);
+    assert(ds4_tp_local_setup(&tp, !(mode == 1 && rank == 1), handle, peer_handle) == expected);
+    if (expected) {
+        check_pattern(peer_handle, sizeof(peer_handle), 1-rank);
+        const int confirmed = ds4_tp_local_confirm(&tp, !(mode == 2 && rank == 1));
+        assert(confirmed == (mode != 2));
+        if (confirmed) {
+            unsigned char events[128], peer_events[128];
+            for (unsigned i = 0; i < sizeof(events); i++) events[i] = (unsigned char)(rank * 97u + i);
+            for (unsigned trial = 0; trial < 3; trial++) {
+                const int ready = !(trial == 1 && rank == 1);
+                const int setup = ds4_tp_local_event_setup(&tp, ready, events, peer_events);
+                assert(setup == (trial != 1));
+                if (setup) {
+                    for (unsigned i = 0; i < sizeof(events); i++)
+                        assert(peer_events[i] == (unsigned char)((1-rank) * 97u + i));
+                    assert(ds4_tp_local_event_confirm(&tp, !(trial == 2 && rank == 1)) == (trial != 2));
+                }
+                assert(ds4_tp_is_local(&tp));
+            }
+            for (uint64_t seq = 1; seq <= 2048; seq++) {
+                if (rank == 1 && seq % 137 == 0) usleep(100);
+                assert(ds4_tp_local_gate(&tp, ((seq-1)%4)/2, (seq-1)%2, seq));
+            }
+            /* Both processes must leave the last successful gate before a
+             * normal teardown (or the intentional peer-death test) starts. */
+            uint8_t finished = 1, peer_finished = 0;
+            assert(tp_write_full(control[rank], &finished, sizeof(finished)));
+            assert(tp_read_full(control[rank], &peer_finished, sizeof(peer_finished)) && peer_finished == 1);
+            if (mode == 3 && rank == 1) {
+                /* A vanished process cannot publish its normal close flag. */
+                close(control[rank]); close(data[rank]); _exit(0);
+            }
+            if (mode == 3) assert(!ds4_tp_local_gate(&tp, 0, 0, 2049));
+        }
+        tp_local_close(&tp);
+    }
+    if (mode == 4) unsetenv("DS4_CUDA_TP_IPC");
+    close(data[rank]); close(control[rank]);
+    if (rank == 1) _exit(0);
+    int status;
+    assert(waitpid(pid, &status, 0) == pid && WIFEXITED(status) && !WEXITSTATUS(status));
+    printf("Local transport cross-process mode=%d: PASS\n", mode);
+}
+#endif
+
+typedef struct {
+    ds4_tp tp;
+    int *tokens;
+    ds4_vision_span *images;
+    uint32_t n_tokens, n_images;
+    int ok;
+} image_peer;
+
+static void *send_images(void *ud) {
+    image_peer *p = ud;
+    p->ok = ds4_tp_send_sync_multimodal(&p->tp, 77, p->tokens, p->n_tokens,
+                                       p->images, p->n_images) &&
+            ds4_tp_send_stop(&p->tp);
+    return NULL;
+}
+
+static void check_image_stream(bool large) {
+    const uint32_t n_images = large ? 1023 : 6144;
+    const uint32_t rows = large ? 1024 : 2;
+    const uint32_t dim = large ? 5120 : 8;
+    const uint32_t n_tokens = n_images * (rows + (large ? 0 : 1)) + 16;
+    const size_t image_bytes = (size_t)rows * dim * sizeof(float);
+    int fd[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, fd) == 0);
+    image_peer tx = {.tp = {.control_fd = fd[0], .peer_ctx = 0, .n_embd = dim},
+        .n_tokens = n_tokens, .n_images = n_images};
+    ds4_tp rx = {.control_fd = fd[1], .peer_ctx = 1048576, .n_embd = dim};
+    tx.tokens = calloc(n_tokens, sizeof(*tx.tokens));
+    tx.images = calloc(n_images, sizeof(*tx.images));
+    /* The large test reuses an immutable source block: no huge sender copy is
+     * needed. The receiver still allocates and verifies the full ~20 GiB. */
+    uint8_t *data = malloc(large ? image_bytes : image_bytes * n_images);
+    assert(tx.tokens && tx.images && data);
+    pattern(data, large ? image_bytes : image_bytes * n_images, 7);
+    for (uint32_t i = 0; i < n_tokens; i++) tx.tokens[i] = (int)(i % 129280);
+    for (uint32_t i = 0; i < n_images; i++) {
+        tx.images[i].token_start = i * (rows + (large ? 0 : 1));
+        tx.images[i].embedding = (ds4_vision_embedding){
+            .data = (float *)(data + (large ? 0 : i * image_bytes)),
+            .token_count = rows, .width = 1000, .height = 800,
+            .content_width = 980, .content_height = 780};
+        memcpy(tx.images[i].embedding.fingerprint, &i, sizeof(i));
+    }
+    /* Reject invalid spans before emitting any bytes, so the pair remains usable. */
+    tx.images[1].token_start = 0;
+    assert(!ds4_tp_send_sync_multimodal(&tx.tp, 77, tx.tokens, n_tokens, tx.images, n_images));
+    tx.images[1].token_start = rows + (large ? 0 : 1);
+    pthread_t thread;
+    const double start = tp_now_sec();
+    assert(!pthread_create(&thread, NULL, send_images, &tx));
+    char err[256] = {0};
+    ds4_tp_command cmd;
+    assert(ds4_tp_recv_command(&rx, &cmd, err, sizeof(err)));
+    assert(cmd.type == DS4_TP_FRAME_SYNC_MULTIMODAL && cmd.session_id == 77);
+    assert(cmd.n_tokens == n_tokens && cmd.n_images == n_images);
+    assert(!memcmp(cmd.tokens, tx.tokens, (size_t)n_tokens * sizeof(*tx.tokens)));
+    for (uint32_t i = 0; i < n_images; i++) {
+        const ds4_vision_embedding *a = &tx.images[i].embedding, *b = &cmd.images[i].embedding;
+        assert(cmd.images[i].token_start == tx.images[i].token_start);
+        assert(a->token_count == b->token_count && a->width == b->width &&
+               a->height == b->height && a->content_width == b->content_width &&
+               a->content_height == b->content_height);
+        assert(!memcmp(a->fingerprint, b->fingerprint, sizeof(a->fingerprint)));
+        assert(!memcmp(a->data, b->data, image_bytes));
+    }
+    ds4_tp_command_free(&cmd);
+    assert(ds4_tp_recv_command(&rx, &cmd, err, sizeof(err)) && cmd.type == DS4_TP_FRAME_STOP);
+    ds4_tp_command_free(&cmd);
+    assert(!pthread_join(thread, NULL) && tx.ok);
+    free(tx.images); free(tx.tokens); free(data); close(fd[0]); close(fd[1]);
+    printf("Multimodal stream: %u images, %u tokens, %.3f GiB exact features + next command: PASS (%.3fs)\n",
+           n_images, n_tokens, (double)image_bytes * n_images / (1ull << 30), tp_now_sec() - start);
+}
+
+static void check_image_stream_rejection(void) {
+    for (int mode = 0; mode < 6; mode++) {
+        int fd[2]; assert(socketpair(AF_UNIX, SOCK_STREAM, 0, fd) == 0);
+        ds4_tp rx = {.control_fd = fd[0], .peer_ctx = 32, .n_embd = 8};
+        ds4_tp_multimodal_command_header h = {77, mode == 0 ? 33 : 4, mode == 1 ? 5 : 1};
+        assert(tp_send_frame(fd[1], DS4_TP_FRAME_SYNC_MULTIMODAL, &h, sizeof(h)));
+        if (mode >= 2) {
+            int32_t tokens[4] = {1, 2, 3, 4};
+            assert(tp_write_full(fd[1], tokens, sizeof(tokens)));
+            ds4_tp_vision_wire wire = {.token_start = 1, .token_count = 2,
+                .data_width = 8, .width = 100, .height = 100};
+            if (mode == 2) wire.data_width = 9;
+            if (mode == 3) wire.token_count = 4;
+            if (mode == 4) wire.width = 0;
+            assert(tp_write_full(fd[1], &wire, sizeof(wire)));
+            /* mode 5 leaves the otherwise valid image feature stream truncated. */
+        }
+        shutdown(fd[1], SHUT_WR);
+        ds4_tp_command cmd; char err[128] = {0};
+        assert(!ds4_tp_recv_command(&rx, &cmd, err, sizeof(err)) && ds4_tp_failed(&rx));
+        close(fd[0]); close(fd[1]);
+    }
+    puts("Multimodal bad count/context/dimension/span/size and truncated stream: PASS");
+}
+
+int main(int argc, char **argv) {
+    if (argc == 2 && !strcmp(argv[1], "--large-images")) {
+        check_image_stream(true);
+        return 0;
+    }
+    check_image_stream(false);
+    check_image_stream_rejection();
+#ifdef __linux__
+    for (int mode = 0; mode < 5; mode++) check_local_processes(mode);
+#endif
+    check_payload_staging(false);
+    check_payload_staging(true);
     for (int tcp = 0; tcp < 2; tcp++) {
         check_exchange(tcp, false);
         check_exchange(tcp, true);

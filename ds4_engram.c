@@ -11,10 +11,9 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <pthread.h>
 #ifdef __APPLE__
 #include <dispatch/dispatch.h>
-#else
-#include <pthread.h>
 #endif
 
 bool ds4_engram_layout_valid(const ds4_engram_layout *l) {
@@ -311,4 +310,105 @@ bool ds4_engram_read_batch(const ds4_engram_table *t, const uint32_t *rows,
     free(request);
     errno = saved;
     return ok;
+}
+
+/* Four readers hide small random-read latency without creating threads for
+ * each token. Jobs for the first Engram layer are issued first; the second
+ * table can finish while the GPU traverses the intervening layers. */
+enum { ENGRAM_DECODE_READERS = 4, ENGRAM_DECODE_ROWS = 2 * DS4_ENGRAM_COLS };
+struct ds4_engram_reader {
+    ds4_engram_table tables[2];
+    pthread_mutex_t lock;
+    pthread_cond_t ready, done;
+    pthread_t threads[ENGRAM_DECODE_READERS];
+    unsigned workers, next, completed[2];
+    int error[2];
+    bool stop;
+    uint32_t ids[ENGRAM_DECODE_ROWS];
+    float *out;
+};
+
+static void *engram_decode_read(void *arg) {
+    ds4_engram_reader *r = arg;
+    pthread_mutex_lock(&r->lock);
+    for (;;) {
+        while (!r->stop && r->next == ENGRAM_DECODE_ROWS)
+            pthread_cond_wait(&r->ready, &r->lock);
+        if (r->stop) break;
+        const unsigned job = r->next++, table = job / DS4_ENGRAM_COLS;
+        pthread_mutex_unlock(&r->lock);
+        const int error = ds4_engram_read(&r->tables[table], &r->ids[job], 1,
+            r->out + job * DS4_ENGRAM_DIM) ? 0 : errno;
+        pthread_mutex_lock(&r->lock);
+        if (error && !r->error[table]) r->error[table] = error;
+        if (++r->completed[table] == DS4_ENGRAM_COLS)
+            pthread_cond_broadcast(&r->done);
+    }
+    pthread_mutex_unlock(&r->lock);
+    return NULL;
+}
+
+void ds4_engram_reader_free(ds4_engram_reader *r) {
+    if (!r) return;
+    pthread_mutex_lock(&r->lock);
+    r->stop = true;
+    pthread_cond_broadcast(&r->ready);
+    pthread_mutex_unlock(&r->lock);
+    for (unsigned i = 0; i < r->workers; i++) pthread_join(r->threads[i], NULL);
+    pthread_cond_destroy(&r->done);
+    pthread_cond_destroy(&r->ready);
+    pthread_mutex_destroy(&r->lock);
+    free(r);
+}
+
+ds4_engram_reader *ds4_engram_reader_create(const ds4_engram_table tables[2]) {
+    if (!tables || tables[0].fd < 0 || tables[1].fd < 0) return NULL;
+    ds4_engram_reader *r = calloc(1, sizeof(*r));
+    if (!r) return NULL;
+    if (pthread_mutex_init(&r->lock, NULL)) { free(r); return NULL; }
+    if (pthread_cond_init(&r->ready, NULL)) {
+        pthread_mutex_destroy(&r->lock); free(r); return NULL;
+    }
+    if (pthread_cond_init(&r->done, NULL)) {
+        pthread_cond_destroy(&r->ready); pthread_mutex_destroy(&r->lock); free(r); return NULL;
+    }
+    memcpy(r->tables, tables, sizeof(r->tables));
+    r->next = ENGRAM_DECODE_ROWS;
+    r->completed[0] = r->completed[1] = DS4_ENGRAM_COLS;
+    while (r->workers < ENGRAM_DECODE_READERS) {
+        if (pthread_create(&r->threads[r->workers], NULL, engram_decode_read, r)) {
+            ds4_engram_reader_free(r); return NULL;
+        }
+        r->workers++;
+    }
+    return r;
+}
+
+bool ds4_engram_reader_start(ds4_engram_reader *r, const uint32_t *rows, float *out) {
+    if (!r || !rows || !out) { errno = EINVAL; return false; }
+    for (unsigned i = 0; i < ENGRAM_DECODE_ROWS; i++) {
+        if (rows[i] >= r->tables[i / DS4_ENGRAM_COLS].rows) { errno = EINVAL; return false; }
+    }
+    pthread_mutex_lock(&r->lock);
+    if (r->stop || r->completed[0] != DS4_ENGRAM_COLS || r->completed[1] != DS4_ENGRAM_COLS) {
+        pthread_mutex_unlock(&r->lock); errno = EBUSY; return false;
+    }
+    memcpy(r->ids, rows, sizeof(r->ids));
+    r->out = out;
+    r->next = r->completed[0] = r->completed[1] = 0;
+    r->error[0] = r->error[1] = 0;
+    pthread_cond_broadcast(&r->ready);
+    pthread_mutex_unlock(&r->lock);
+    return true;
+}
+
+bool ds4_engram_reader_wait(ds4_engram_reader *r, unsigned table) {
+    if (!r || table >= 2) { errno = EINVAL; return false; }
+    pthread_mutex_lock(&r->lock);
+    while (r->completed[table] != DS4_ENGRAM_COLS)
+        pthread_cond_wait(&r->done, &r->lock);
+    const int error = r->error[table];
+    pthread_mutex_unlock(&r->lock);
+    if (error) errno = error;
+    return error == 0;
 }

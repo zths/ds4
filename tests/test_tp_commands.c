@@ -40,6 +40,15 @@ static void check_bulk_exchange(void) {
             peer[0].tp.gate_timeout_ms = peer[1].tp.gate_timeout_ms = 50;
             peer[1].delay = 150000;
         }
+        /* Linux rounds socket timeouts to scheduler ticks (e.g. 50 -> 52 ms).
+         * Compare the restored value to the kernel's configured value. */
+        struct timeval expected_timeout[2];
+        for (unsigned rank = 0; rank < 2; rank++) {
+            assert(tp_socket_set_gate_timeout(fd[rank], peer[rank].tp.gate_timeout_ms));
+            socklen_t len = sizeof(expected_timeout[rank]);
+            assert(getsockopt(fd[rank], SOL_SOCKET, SO_RCVTIMEO,
+                              &expected_timeout[rank], &len) == 0);
+        }
         pthread_t thread;
         assert(pthread_create(&thread, NULL, exchange_bulk, &peer[1]) == 0);
         exchange_bulk(&peer[0]);
@@ -51,8 +60,8 @@ static void check_bulk_exchange(void) {
             struct timeval timeout;
             socklen_t len = sizeof(timeout);
             assert(getsockopt(fd[rank], SOL_SOCKET, SO_RCVTIMEO, &timeout, &len) == 0);
-            assert((uint64_t)timeout.tv_sec * 1000u + timeout.tv_usec / 1000u ==
-                   peer[rank].tp.gate_timeout_ms);
+            assert(timeout.tv_sec == expected_timeout[rank].tv_sec &&
+                   timeout.tv_usec == expected_timeout[rank].tv_usec);
             free(peer[rank].in); free(peer[rank].out); close(fd[rank]);
         }
     }
@@ -201,7 +210,7 @@ int main(void) {
     ds4_tp worker = { .control_fd = fd[1] };
     char err[256] = "";
     ds4_tp_command cmd;
-    assert(DS4_TP_PROTOCOL_VERSION == 14);
+    assert(DS4_TP_PROTOCOL_VERSION == 17);
     for (int i = 0; i < 4; i++) {
         assert(ds4_tp_send_eval(&leader, 42, 2*i, 100+i));
         assert(ds4_tp_recv_command(&worker, &cmd, err, sizeof(err)));

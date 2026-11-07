@@ -43,11 +43,26 @@ returned separately from visible text in each API's native form. Standard
 sampling and output-budget fields are supported; explicit request parameters
 take precedence over defaults.
 
+HTTP/1.1 uploads accept either `Content-Length` or `Transfer-Encoding: chunked`.
+The decoded request body is limited to 1 GiB in both cases. Chunk extensions
+and bounded trailers are accepted; conflicting length/encoding headers and
+unsupported transfer codings are rejected. HTTP 400 rejections are logged with
+their reason (and API path/body size when parsing reached the API), without
+logging request contents or credentials.
+
 The default sampling settings are temperature 1, top-p 1, and min-p 0.05.
-For DeepSeek, thinking is on by default. `reasoning_effort=max` selects Think
-Max only with sufficient context; otherwise it falls back to normal thinking.
-`xhigh` maps to normal thinking, not Think Max. Use `think:false`, a disabled
-thinking object, or a non-thinking model alias for direct answers.
+For DeepSeek, thinking is on by default. V4.1 uses the official numeric effort
+presets: `low` = 50, `high` = 75, `max` = 100; `minimal` aliases `low`, and
+`medium`/`xhigh` alias `high`. Explicit numeric strings such as `"25"` also work.
+For V4.0, `max` requires sufficient context and otherwise falls back to normal
+thinking; `xhigh` selects normal thinking.
+
+Set effort through Chat `reasoning_effort`, Responses `reasoning.effort`, or
+Anthropic `output_config.effort`. Named values are case-insensitive, so `Low`,
+`LOW`, and `low` produce the same prompt. `off` and `none` disable thinking.
+The `enabled`/`disabled` values in `thinking.type` are also case-insensitive;
+an explicit disabled thinking control takes precedence over the effort preset.
+Chat also accepts `think:false`; non-thinking model aliases remain supported.
 
 ## Multiple sessions
 
@@ -96,10 +111,16 @@ For the eight-L40S example, see [CUDA GPUs](CUDA_MULTI_GPU.md#serve-multiple-use
 Start with the matching language GGUF and `--vision FILE`; see
 [model-specific instructions](MODELS.md#vision).
 
-OpenAI chat and Responses accept inline PNG/JPEG data URIs. Anthropic accepts
-base64 image sources. Remote URLs and server-side file paths are rejected.
-Image blocks preserve their order in the request. The limit is 16 images and
-a 64 MiB HTTP body.
+OpenAI chat and Responses accept inline PNG/JPEG/WebP data URIs. Anthropic accepts
+base64 image sources, including images nested in tool results. Remote URLs and
+server-side file paths are rejected. Image blocks preserve their request order;
+their token count must fit the context. The maximum HTTP body is 1 GiB.
+
+WebP is enabled when `pkg-config` finds `libwebp` at build time (on Debian,
+install `libwebp-dev` and `pkg-config`). Static lossy, lossless and transparent
+WebP images use the existing RGB preprocessing and cache fingerprint. Alpha is
+ignored, matching PNG behavior. Animated WebP is rejected explicitly. PNG/JPEG
+remain available without the optional library.
 
 ## Disk KV cache
 
@@ -147,3 +168,85 @@ Cache formats are implementation details. The current header and extension
 definitions are in [ds4_kvstore.h](../ds4_kvstore.h) and
 [ds4_kvstore.c](../ds4_kvstore.c); model-specific payload handling is in
 [ds4.c](../ds4.c).
+
+## Persistent image files (local extension)
+
+`POST /v1/files` accepts multipart `file` plus `purpose` (`vision`, `user_data`,
+or `assistants`; default `vision`). Only valid PNG, JPEG and WebP images are
+accepted, up to 48 MiB each. Both Content-Length and chunked uploads work.
+A successful upload returns a file object with `id`, `bytes`, `created_at`,
+`filename`, `purpose`, `mime_type` and `status: processed`.
+
+Files use the existing server's access boundary; this is a shared local store,
+not per-API-key isolation. Original encoded bytes use a separate persistent LRU, independently of the
+embedding and KV cache eviction policies. The original-image quota is 64 GiB.
+When an upload would exceed it, the least recently used files are deleted in
+a batch totaling at least 8 GiB (whole files, so the batch can slightly exceed
+8 GiB). Inference references and content downloads refresh usage; metadata and
+list requests do not. Usage times survive restart. Explicit DELETE is also supported. The default directory is `<kv-disk-dir>/uploaded-images`;
+`DS4_FILES_DIR` overrides it (the parent must already exist). Without either
+setting, file endpoints return 503. Set a shared `DS4_FILES_DIR` if IDs should
+remain accessible across model/cache-directory changes.
+
+```sh
+curl http://localhost:8000/v1/files \
+  -F purpose=vision -F file=@picture.webp
+curl http://localhost:8000/v1/files/file-REPLACE_ME
+curl http://localhost:8000/v1/files/file-REPLACE_ME/content -o original.webp
+curl 'http://localhost:8000/v1/files?limit=100&order=desc'
+curl -X DELETE http://localhost:8000/v1/files/file-REPLACE_ME
+```
+
+GET `/v1/files` supports `limit` (1–10000, default 100), `order` (`asc`/`desc`,
+default desc), `after` and `purpose`. Results have `data`, `first_id`, `last_id`,
+and `has_more`. Order is upload timestamp then ID. GET `/v1/files/{id}/content`
+returns the original bytes. Missing/deleted/evicted IDs return 404 for file operations
+and 400 with `error.type: invalid_request_error`, `error.code: file_not_found`,
+`error.param: <missing-id>` and `error.message: file <missing-id> not found` in
+inference requests (the first missing ID when several are absent). Clients must re-upload
+an image if its ID has been evicted; the server cannot recover a deleted original. DELETE removes the
+original; it does not retroactively clear existing KV or embedding caches, or
+cancel a request that has already loaded the image.
+
+Reference shapes inside message content:
+
+* Responses: `{"type":"input_image","file_id":"file-..."}`.
+* Chat Completions: `{"type":"file","file":{"file_id":"file-..."}}`
+  loads an uploaded image as vision input, not extracted text.
+* Chat local extension: `{"type":"image_url","image_url":{"url":"file-..."}}`.
+  `input_image.file_id` and `image_file.image_file.file_id` are also accepted.
+* Anthropic Messages: `{"type":"image","source":{"type":"file","file_id":"file-..."}}`,
+  including images nested in tool results. Upload/list responses use the OpenAI
+  file-object shape; this is not a full Anthropic Files API implementation.
+
+File IDs are opaque random values, never filesystem paths. Referenced files
+enter the same vision pipeline as inline images without a Base64 round-trip;
+image embeddings and KV caches are reused normally. The client must upload once
+and then send the ID; existing clients that keep sending inline Base64 do not
+automatically benefit. Images still consume context tokens and their first
+vision encoding/prefill is still necessary. PDF/documents, remote URL fetching,
+expiration policies and non-image Files API purposes are not implemented. Unknown
+multipart fields, including `expires_after[anchor]` and `expires_after[seconds]`,
+are accepted and ignored; local LRU remains authoritative.
+
+## API key authentication
+
+Set `DS4_API_KEY` to enable a shared API key (16–256 printable non-space ASCII
+characters). If set but empty/invalid, startup fails. Without this variable the
+standalone server retains its previous unauthenticated behavior.
+
+For deployment, keep the generated key in a root-readable environment file
+(mode 0600) and load it with systemd `EnvironmentFile=` or your process manager.
+Never commit the key or put it in a public startup script.
+Supply `Authorization: Bearer <key>` or `x-api-key: <key>`. All resource routes,
+including models, files, downloads, deletion and inference, require credentials.
+Missing/incorrect credentials return HTTP 401 with `authentication_error` before
+reading the request body. Duplicate credential headers are rejected; if both
+header conventions are sent, both must match. Header/scheme names are case
+insensitive; key values are case sensitive. OPTIONS preflight alone is exempt
+and returns no resource data. Credentials are not logged.
+
+Configure the same key in the client's API Key field. Existing curl examples
+above also need `-H "Authorization: Bearer <key>"`. To rotate, replace the value
+in the protected environment file and restart the service. Health checks and
+model-list requests must also include the configured key.

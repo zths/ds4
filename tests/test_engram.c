@@ -232,7 +232,60 @@ static void test_all_scaled_values(void) {
     close(fd);
 }
 
+/* Concurrent reads must preserve the exact scalar values, including repeated
+ * row IDs. Reusing/canceling the pool must never keep a caller's old buffer. */
+static void test_decode_reader(void) {
+    char path[] = "/tmp/ds4-engram-reader-XXXXXX";
+    const int fd = mkstemp(path);
+    assert(fd >= 0 && unlink(path) == 0);
+    enum { ROWS = 37, N = 2 * DS4_ENGRAM_COLS, WIDTH = N * DS4_ENGRAM_DIM };
+    uint8_t raw[ROWS][DS4_ENGRAM_ROW_BYTES];
+    for (unsigned row = 0; row < ROWS; row++) {
+        memset(raw[row], 16 + row, DS4_ENGRAM_DIM);
+        memset(raw[row] + DS4_ENGRAM_DIM, 118 + row % 19, DS4_ENGRAM_ROW_BYTES - DS4_ENGRAM_DIM);
+    }
+    assert(write(fd, raw, sizeof(raw)) == sizeof(raw));
+    ds4_engram_table tables[2] = {{.fd=fd,.rows=ROWS}, {.fd=fd,.rows=ROWS}};
+    ds4_engram_reader *reader = ds4_engram_reader_create(tables);
+    assert(reader);
+    uint32_t ids[N];
+    float actual[WIDTH + 1], expected[WIDTH];
+    for (unsigned step = 0; step < 257; step++) {
+        for (unsigned j = 0; j < N; j++) ids[j] = (j * 11 + step * 7) % ROWS;
+        assert(ds4_engram_read(&tables[0], ids, N, expected));
+        actual[WIDTH] = 123456.0f;
+        assert(ds4_engram_reader_start(reader, ids, actual));
+        /* Waiting in either order also has to drain all pending reads. */
+        assert(ds4_engram_reader_wait(reader, step & 1));
+        assert(ds4_engram_reader_wait(reader, 1 - (step & 1)));
+        assert(!memcmp(actual, expected, sizeof(expected)) && actual[WIDTH] == 123456.0f);
+    }
+    ids[0] = ROWS;
+    assert(!ds4_engram_reader_start(reader, ids, actual) && errno == EINVAL);
+    ids[0] = 0;
+    uint8_t invalid = 127;
+    assert(pwrite(fd, &invalid, 1, 0) == 1);
+    assert(ds4_engram_reader_start(reader, ids, actual));
+    assert(!ds4_engram_reader_wait(reader, 0) && errno == EDOM);
+    (void)ds4_engram_reader_wait(reader, 1);
+    assert(ftruncate(fd, 0) == 0);
+    assert(ds4_engram_reader_start(reader, ids, actual));
+    assert(!ds4_engram_reader_wait(reader, 0) && errno == EIO);
+    assert(!ds4_engram_reader_wait(reader, 1) && errno == EIO);
+    ds4_engram_reader_free(reader);
+    assert(pwrite(fd, raw, sizeof(raw), 0) == sizeof(raw));
+    for (unsigned i = 0; i < 16; i++) {
+        reader = ds4_engram_reader_create(tables);
+        assert(reader && ds4_engram_reader_start(reader, ids, actual));
+        ds4_engram_reader_free(reader);
+        memset(actual, 0, sizeof(actual)); /* no worker may still write here */
+    }
+    close(fd);
+    puts("Engram persistent reader parity, reuse, read errors and drain: PASS");
+}
+
 int main(void) {
+    test_decode_reader();
     test_hash();
     test_rows();
     test_all_scaled_values();
